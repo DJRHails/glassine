@@ -421,4 +421,129 @@ ok 'status labels encrypted, empty, and PLAINTEXT files'
 )
 ok 'uninstall stops smudging; re-init decrypts again'
 
+# --- gnarly-process regressions (21-27): fresh managed repos per scenario ------
+
+HOME3="$WORK/home3"
+mkdir -p "$HOME3/.ssh"
+ssh-keygen -t ed25519 -N '' -C 'dh@gnarly' -f "$HOME3/.ssh/id_ed25519" -q
+g3() { HOME=$HOME3 "$@"; }
+
+# Managed repo with one committed 5-line secret; prints its path.
+mk_managed() { # <name>
+  local r="$WORK/$1"
+  mkdir -p "$r" && cd "$r"
+  git_q init
+  git config user.name test && git config user.email test@example.invalid
+  g3 glassine init >/dev/null 2>&1
+  g3 glassine protect 'secrets/**' >/dev/null 2>&1
+  mkdir -p secrets
+  printf 'k1: v1\npad1: x\npad2: x\npad3: x\nk2: v1\n' >secrets/s.yaml
+  g3 git add . && g3 git commit -qm base
+  printf '%s' "$r"
+}
+
+# --- 21: stash / stash pop -------------------------------------------------------
+
+(
+  cd "$(mk_managed stash)"
+  printf 'k1: CHANGED\npad1: x\npad2: x\npad3: x\nk2: v1\n' >secrets/s.yaml
+  g3 git stash >/dev/null 2>&1 || fail 'stash failed'
+  grep -q 'k1: v1' secrets/s.yaml || fail 'stash did not restore the committed version'
+  g3 git stash pop >/dev/null 2>&1 || fail 'stash pop failed'
+  grep -q 'k1: CHANGED' secrets/s.yaml || fail 'stash pop lost the change'
+  g3 git add secrets/s.yaml
+  git cat-file blob :secrets/s.yaml | grep -q 'ENC\[AES256_GCM' || fail 'post-pop add not encrypted'
+)
+ok 'stash/pop round-trips an in-progress secret edit'
+
+# --- 22: rebase replays through the merge driver -----------------------------------
+
+(
+  cd "$(mk_managed rebase)"
+  BASE_BRANCH=$(git branch --show-current)
+  g3 git checkout -qb feature
+  printf 'k1: feat\npad1: x\npad2: x\npad3: x\nk2: v1\n' >secrets/s.yaml
+  g3 git add . && g3 git commit -qm feat
+  g3 git checkout -q -
+  printf 'k1: v1\npad1: x\npad2: x\npad3: x\nk2: main\n' >secrets/s.yaml
+  g3 git add . && g3 git commit -qm main-edit
+  g3 git checkout -q feature
+  g3 git rebase -q "$BASE_BRANCH" >/dev/null 2>&1 || fail 'rebase replay conflicted'
+  grep -q 'k1: feat' secrets/s.yaml || fail 'rebase lost the feature edit'
+  grep -q 'k2: main' secrets/s.yaml || fail 'rebase lost the upstream edit'
+)
+ok 'rebase replays encrypted changes through the merge driver'
+
+# --- 23: cherry-pick and revert ------------------------------------------------------
+
+(
+  cd "$(mk_managed cherry)"
+  g3 git checkout -qb donor
+  printf 'k1: cherry\npad1: x\npad2: x\npad3: x\nk2: v1\n' >secrets/s.yaml
+  g3 git add . && g3 git commit -qm donate
+  DONATE=$(git rev-parse HEAD)
+  g3 git checkout -q -
+  g3 git cherry-pick "$DONATE" >/dev/null 2>&1 || fail 'cherry-pick failed'
+  grep -q 'k1: cherry' secrets/s.yaml || fail 'cherry-pick lost the edit'
+  g3 git revert --no-edit HEAD >/dev/null 2>&1 || fail 'revert failed'
+  grep -q 'k1: v1' secrets/s.yaml || fail 'revert produced wrong content'
+)
+ok 'cherry-pick and revert work on encrypted files'
+
+# --- 24: rotation race — merge causes drift; check catches; rotate heals -------------
+
+ssh-keygen -t ed25519 -N '' -C 'dh@late' -f "$WORK/keys/late" -q
+(
+  cd "$(mk_managed rotrace)"
+  g3 git checkout -qb grantor
+  g3 glassine allow "$WORK/keys/late.pub" >/dev/null 2>&1
+  g3 git add -A && g3 git commit -qm 'allow late key'
+  g3 git checkout -q -
+  printf 'k1: edited\npad1: x\npad2: x\npad3: x\nk2: v1\n' >secrets/s.yaml
+  g3 git add . && g3 git commit -qm edit
+  g3 git merge -q grantor -m merged >/dev/null 2>&1 || fail 'rotation-race merge conflicted'
+  # The envelope was re-encrypted under the pre-merge policy: drift.
+  if g3 glassine check >/dev/null 2>&1; then
+    fail 'check missed recipient drift after the merge'
+  fi
+  g3 glassine rotate >/dev/null && g3 git commit -qam 'heal drift'
+  g3 glassine check >/dev/null 2>&1 || fail 'check still failing after rotate'
+  git cat-file blob :secrets/s.yaml >"$WORK/healed.enc"
+  HOME="$WORK/keys" as_host late sops decrypt --filename-override secrets/s.yaml "$WORK/healed.enc" >/dev/null 2>&1 ||
+    fail 'late key still cannot read after rotate'
+)
+ok 'merge-induced recipient drift: check flags it, rotate heals it'
+
+# --- 25: git worktree add decrypts (the transcrypt killer) ----------------------------
+
+(
+  cd "$(mk_managed wtree)"
+  g3 git worktree add -q "$WORK/wt" -b wt-branch >/dev/null 2>&1 || fail 'worktree add failed'
+  grep -q 'k1: v1' "$WORK/wt/secrets/s.yaml" || fail 'worktree did not decrypt secrets'
+  g3 git worktree remove "$WORK/wt"
+)
+ok 'git worktree add decrypts secrets in the new worktree'
+
+# --- 26: git archive exports plaintext on a keyed host (documented behavior) -----------
+
+(
+  cd "$(mk_managed archive)"
+  g3 git archive HEAD -o "$WORK/arch.tar"
+  mkdir -p "$WORK/arch" && tar -xf "$WORK/arch.tar" -C "$WORK/arch"
+  grep -q 'k1: v1' "$WORK/arch/secrets/s.yaml" ||
+    fail 'archive behavior changed: expected plaintext on a keyed host'
+)
+ok 'git archive applies smudge: tarballs from keyed hosts hold plaintext'
+
+# --- 27: symlinks bypass filters (documented behavior) ----------------------------------
+
+(
+  cd "$(mk_managed symlink)"
+  ln -s s.yaml secrets/link.yaml
+  g3 git add secrets/link.yaml && g3 git commit -qm link
+  [ "$(git cat-file blob :secrets/link.yaml)" = 's.yaml' ] ||
+    fail 'symlink behavior changed: expected raw target in blob'
+)
+ok 'symlinks are stored raw: targets are never encrypted'
+
 printf '\nall %d tests passed\n' "$PASS"

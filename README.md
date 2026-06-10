@@ -99,7 +99,15 @@ editing recipients manually).
 Encrypted files merge **in plaintext**: the merge driver decrypts base, ours,
 and theirs, runs git's standard three-way merge, and re-encrypts clean
 results. Conflicts surface as ordinary plaintext conflict markers in your
-working tree; resolve and `git add` as usual (the add re-encrypts).
+working tree; resolve and `git add` as usual (the add re-encrypts). Rebase,
+cherry-pick, revert, and stash all ride the same machinery and work.
+
+One caveat: if a merge brings in a **`.sops.yaml` change** (someone ran
+`allow`/`revoke` on the other branch), merged envelopes are re-encrypted
+under the *pre-merge* policy — a newly-allowed key silently can't read, a
+newly-revoked one still can. `glassine check` detects this **recipient
+drift**; fix it with `glassine rotate` and commit. Running `check` as a
+pre-commit hook closes the gap entirely.
 
 ## How it works
 
@@ -121,9 +129,13 @@ Safety properties:
 - already-encrypted input passes through `clean` untouched — keyless
   checkouts round-trip envelopes losslessly
 - `glassine check` catches the classic footgun where `.gitattributes`
-  references a filter that isn't configured, so plaintext slips through
+  references a filter that isn't configured, so plaintext slips through —
+  and flags recipient drift (envelopes whose key set no longer matches
+  `.sops.yaml`, e.g. after a merge)
 - empty files pass through unencrypted (sops refuses empty input, and there
   is nothing to protect); `check` and `status` treat them accordingly
+- `git worktree add` works — secrets decrypt in new worktrees (filters are
+  plain config, unlike transcrypt's per-worktree crypt directory)
 
 ## Limitations
 
@@ -137,6 +149,14 @@ Safety properties:
   `SOPS_AGE_SSH_PRIVATE_KEY_CMD`.
 - Merging encrypted files needs a decryption identity; keyless hosts fall
   back to ciphertext-level conflicts.
+- **`git archive` exports plaintext on a keyed host** (smudge is applied to
+  archive contents; keyless hosts get ciphertext). Don't tarball a checkout
+  to share it.
+- **Symlinks are never encrypted** — git bypasses filters for them; the link
+  target is stored raw.
+- Filters spawn one process per file: a mass-`touch` of ~100 secrets costs
+  ~10s on the next `git status`. Fine at dotfiles scale; a long-running
+  filter-process protocol is the known fix if it ever matters.
 - Remote-side diffs of secrets are opaque churn (every real change mints a
   fresh data key). Local diffs are plaintext via textconv.
 

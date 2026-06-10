@@ -10,7 +10,7 @@
 # https://github.com/DJRHails/glassine
 set -euo pipefail
 
-readonly VERSION='0.2.1'
+readonly VERSION='0.3.0'
 
 GLASSINE_TMPDIR=''
 
@@ -196,6 +196,18 @@ managed_files() {
 
 sops_yaml_managed() { # <file>
   head -1 "$1" 2>/dev/null | grep -q 'managed by glassine'
+}
+
+# Key tokens from a managed .sops.yaml (keys only appear on recipient lines).
+policy_keys() { # <file>
+  LC_ALL=C grep -aoE 'ssh-(ed25519|rsa) [A-Za-z0-9+/=]+|age1[0-9a-z]+' "$1" | sort -u || true
+}
+
+# Key tokens an envelope is actually wrapped to. Restricted to lines that
+# mention "recipient" so base64 payload can't false-match.
+envelope_keys() { # <file>
+  LC_ALL=C grep -a 'recipient' "$1" |
+    LC_ALL=C grep -aoE 'ssh-(ed25519|rsa) [A-Za-z0-9+/=]+|age1[0-9a-z]+' | sort -u || true
 }
 
 create_sops_yaml() { # <file>
@@ -438,20 +450,36 @@ cmd_rotate() { # [paths...]
   printf 'glassine: re-encrypted %d file(s) with fresh data keys — review and commit\n' "${#files[@]}"
 }
 
-# Verify every staged managed file is an envelope. Run as a pre-commit hook
-# to catch the classic filter failure: .gitattributes says filter=glassine
-# but the driver is missing from git config, so git silently skips it.
+# Verify every staged managed file is an envelope, and (for a glassine-managed
+# .sops.yaml) that each envelope's recipient set matches policy. Run as a
+# pre-commit hook. Catches two failure classes:
+#  - the filter silently not running (.gitattributes set, git config missing)
+#  - recipient drift: merging a branch that changed .sops.yaml re-encrypts
+#    envelopes under the pre-merge policy, so newly-allowed keys silently
+#    can't read (and newly-revoked ones still can) until a rotate
 cmd_check() {
+  local root
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || die 'not inside a git repository'
   ensure_tmpdir
-  local f bad=0 blob="$GLASSINE_TMPDIR/blob"
+  local f bad=0 drift=0 blob="$GLASSINE_TMPDIR/blob" policy=''
+  if [ -f "$root/.sops.yaml" ] && sops_yaml_managed "$root/.sops.yaml"; then
+    policy=$(policy_keys "$root/.sops.yaml")
+  fi
   while IFS= read -r -d '' f; do
     # Empty blobs pass through unencrypted by design — nothing to protect.
-    if git cat-file blob ":$f" >"$blob" 2>/dev/null && [ -s "$blob" ] && ! is_envelope "$blob"; then
+    if ! git cat-file blob ":$f" >"$blob" 2>/dev/null || [ ! -s "$blob" ]; then
+      continue
+    fi
+    if ! is_envelope "$blob"; then
       printf 'glassine: NOT ENCRYPTED in index: %s\n' "$f" >&2
       bad=1
+    elif [ -n "$policy" ] && [ "$(envelope_keys "$blob")" != "$policy" ]; then
+      printf 'glassine: RECIPIENT DRIFT in index: %s\n' "$f" >&2
+      drift=1
     fi
   done < <(managed_files)
   [ "$bad" -eq 0 ] || die 'plaintext staged for managed paths — run "glassine init" then "glassine rotate"'
+  [ "$drift" -eq 0 ] || die 'envelopes do not match .sops.yaml recipients (common after merges) — run "glassine rotate" and commit'
 }
 
 cmd_status() {
