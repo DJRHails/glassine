@@ -23,8 +23,22 @@ warn() {
   printf 'glassine: %s\n' "$*" >&2
 }
 
-require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+# Hard requirement on sops, with an actionable install hint. Deliberately
+# never auto-installs: pulling a crypto engine onto the machine is the
+# user's call, via their own package manager.
+need_sops() {
+  command -v sops >/dev/null 2>&1 && return 0
+  local hint='https://github.com/getsops/sops/releases'
+  if command -v brew >/dev/null 2>&1; then
+    hint='brew install sops'
+  elif command -v apt-get >/dev/null 2>&1; then
+    hint='apt-get install sops (or grab a release: https://github.com/getsops/sops/releases)'
+  elif command -v pacman >/dev/null 2>&1; then
+    hint='pacman -S sops'
+  elif command -v nix-env >/dev/null 2>&1; then
+    hint='nix-env -iA nixpkgs.sops'
+  fi
+  die "sops is required but not installed — try: $hint"
 }
 
 ensure_tmpdir() {
@@ -63,7 +77,7 @@ decrypt_to() { # <src> <dst> <repo-relative-path>
 # envelope decrypts to exactly the incoming plaintext, re-emit it unchanged.
 cmd_clean() { # <repo-relative-path>
   local path=$1
-  require_cmd sops
+  need_sops
   ensure_tmpdir
   local work="$GLASSINE_TMPDIR/work"
   cat >"$work"
@@ -137,7 +151,7 @@ managed_files() {
 cmd_init() {
   local root
   root=$(git rev-parse --show-toplevel 2>/dev/null) || die 'not inside a git repository'
-  require_cmd sops
+  need_sops
   command -v glassine >/dev/null 2>&1 ||
     warn 'glassine is not on PATH; the filters below will fail until it is'
 
