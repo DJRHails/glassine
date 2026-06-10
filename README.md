@@ -122,6 +122,8 @@ Safety properties:
   checkouts round-trip envelopes losslessly
 - `glassine check` catches the classic footgun where `.gitattributes`
   references a filter that isn't configured, so plaintext slips through
+- empty files pass through unencrypted (sops refuses empty input, and there
+  is nothing to protect); `check` and `status` treat them accordingly
 
 ## Limitations
 

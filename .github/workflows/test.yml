@@ -1,0 +1,47 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            sops_asset: sops-v3.13.1.linux.amd64
+          - os: macos-latest
+            sops_asset: sops-v3.13.1.darwin.arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install sops v3.13.1 (checksum-verified)
+        env:
+          ASSET: ${{ matrix.sops_asset }}
+        run: |
+          set -euo pipefail
+          base='https://github.com/getsops/sops/releases/download/v3.13.1'
+          curl -fsSLO "$base/$ASSET"
+          curl -fsSLO "$base/sops-v3.13.1.checksums.txt"
+          grep " ${ASSET}\$" sops-v3.13.1.checksums.txt | shasum -a 256 -c -
+          sudo install -m 0755 "$ASSET" /usr/local/bin/sops
+          sops --version
+
+      - name: Lint
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q && sudo apt-get install -y -q shellcheck
+          shellcheck -x glassine test/run.sh
+
+      - name: Integration tests
+        run: bash test/run.sh

@@ -294,4 +294,131 @@ ok 'merge driver: clean 3-way merge in plaintext, re-encrypted result'
 )
 ok 'merge driver: conflicts are plaintext; resolution re-encrypts'
 
+# --- 14: allow github:user — hermetic via a curl stub ---------------------------
+
+for h in hostd hoste; do
+  ssh-keygen -t ed25519 -N '' -C "dh@$h" -f "$WORK/keys/$h" -q
+done
+mkdir -p "$WORK/stub"
+cat >"$WORK/stub/curl" <<EOF
+#!/usr/bin/env bash
+# Stub of github.com/<user>.keys: two usable keys plus one unsupported type.
+cat '$WORK/keys/hostd.pub' '$WORK/keys/hoste.pub'
+echo 'ecdsa-sha2-nistp256 AAAAunsupported ignored'
+EOF
+chmod +x "$WORK/stub/curl"
+(
+  cd "$AUTO"
+  PATH="$WORK/stub:$PATH" HOME=$HOME2 glassine allow github:fakeuser >/dev/null
+  [ "$(grep -c 'github:fakeuser' .sops.yaml)" = '2' ] ||
+    fail 'allow github: did not record exactly the two supported keys'
+  git cat-file blob :secrets/a.yaml >"$WORK/gh.enc"
+  as_host hostd sops decrypt --filename-override secrets/a.yaml "$WORK/gh.enc" >/dev/null 2>&1 ||
+    fail 'github-imported key cannot decrypt after allow'
+  BLOB_T14=$(git rev-parse :secrets/a.yaml)
+  PATH="$WORK/stub:$PATH" HOME=$HOME2 glassine allow github:fakeuser >/dev/null 2>&1
+  [ "$(grep -c 'github:fakeuser' .sops.yaml)" = '2' ] ||
+    fail 'duplicate allow added recipients again'
+  [ "$(git rev-parse :secrets/a.yaml)" = "$BLOB_T14" ] ||
+    fail 'no-op allow still rotated the envelopes'
+  HOME=$HOME2 git commit -qm 'allow github:fakeuser'
+)
+ok 'allow github:user imports supported keys, dedupes, skips no-op rotation'
+
+# --- 15: binary files round-trip ------------------------------------------------
+
+(
+  cd "$AUTO"
+  head -c 1024 /dev/urandom >secrets/blob.bin
+  cp secrets/blob.bin "$WORK/blob.orig"
+  HOME=$HOME2 git add secrets/blob.bin
+  git cat-file blob :secrets/blob.bin | grep -q 'ENC\[AES256_GCM' ||
+    fail 'binary file was not encrypted'
+  HOME=$HOME2 git commit -qm 'binary secret'
+  rm secrets/blob.bin
+  HOME=$HOME2 git checkout -- secrets/blob.bin
+  cmp -s secrets/blob.bin "$WORK/blob.orig" ||
+    fail 'binary did not round-trip bit-for-bit'
+)
+ok 'binary secrets encrypt and round-trip bit-for-bit'
+
+# --- 16: filenames with spaces ---------------------------------------------------
+
+(
+  cd "$AUTO"
+  echo 'k: v' >'secrets/my secret.yaml'
+  HOME=$HOME2 git add 'secrets/my secret.yaml'
+  git cat-file blob ':secrets/my secret.yaml' | grep -q 'ENC\[AES256_GCM' ||
+    fail 'space-named file was not encrypted'
+  HOME=$HOME2 git commit -qm 'space name'
+  HOME=$HOME2 glassine rotate 'secrets/my secret.yaml' >/dev/null ||
+    fail 'rotate failed on space-named file'
+  rm 'secrets/my secret.yaml'
+  HOME=$HOME2 git checkout -- 'secrets/my secret.yaml'
+  grep -q 'k: v' 'secrets/my secret.yaml' ||
+    fail 'space-named file did not round-trip'
+  HOME=$HOME2 git commit -qam 'rotate space name'
+)
+ok 'filenames with spaces survive clean/smudge/rotate'
+
+# --- 17: empty files pass through ------------------------------------------------
+
+(
+  cd "$AUTO"
+  : >secrets/empty.yaml
+  HOME=$HOME2 git add secrets/empty.yaml ||
+    fail 'adding an empty file failed'
+  [ -z "$(git cat-file blob :secrets/empty.yaml)" ] ||
+    fail 'empty file gained content in the index'
+  HOME=$HOME2 git commit -qm 'empty file'
+  touch secrets/empty.yaml
+  [ -z "$(HOME=$HOME2 git status --porcelain secrets/empty.yaml)" ] ||
+    fail 'empty file does not round-trip cleanly'
+  HOME=$HOME2 glassine check >/dev/null 2>&1 ||
+    fail 'check flagged an empty file as plaintext'
+)
+ok 'empty files pass through and do not trip check'
+
+# --- 18: revoke with no match fails loudly ---------------------------------------
+
+(
+  cd "$AUTO"
+  if HOME=$HOME2 glassine revoke 'no-such-recipient-zzz' >/dev/null 2>&1; then
+    fail 'revoke succeeded with no matching recipient'
+  fi
+)
+ok 'revoke with no matching recipient fails'
+
+# --- 19: status reports index states ----------------------------------------------
+
+(
+  cd "$AUTO"
+  HOME=$HOME2 glassine status >"$WORK/status.out"
+  grep -Eq '^encrypted +secrets/a.yaml' "$WORK/status.out" ||
+    fail 'status missing encrypted row'
+  grep -Eq '^empty +secrets/empty.yaml' "$WORK/status.out" ||
+    fail 'status missing empty row'
+)
+(
+  cd "$BARE"
+  glassine status | grep -Eq '^PLAINTEXT +secrets/leak.yaml' ||
+    fail 'status did not flag staged plaintext'
+)
+ok 'status labels encrypted, empty, and PLAINTEXT files'
+
+# --- 20: uninstall stops smudging; re-init recovers --------------------------------
+
+(
+  cd "$AUTO"
+  HOME=$HOME2 glassine uninstall 2>/dev/null
+  rm secrets/a.yaml
+  git checkout -- secrets/a.yaml
+  grep -q 'ENC\[AES256_GCM' secrets/a.yaml ||
+    fail 'uninstall did not stop decryption on checkout'
+  HOME=$HOME2 glassine init >/dev/null
+  grep -q 'tok: abc' secrets/a.yaml ||
+    fail 're-init did not restore plaintext'
+)
+ok 'uninstall stops smudging; re-init decrypts again'
+
 printf '\nall %d tests passed\n' "$PASS"

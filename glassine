@@ -10,7 +10,7 @@
 # https://github.com/DJRHails/glassine
 set -euo pipefail
 
-readonly VERSION='0.2.0'
+readonly VERSION='0.2.1'
 
 GLASSINE_TMPDIR=''
 
@@ -81,6 +81,12 @@ cmd_clean() { # <repo-relative-path>
   ensure_tmpdir
   local work="$GLASSINE_TMPDIR/work"
   cat >"$work"
+
+  # sops refuses empty input ("must contain at least one document"); there is
+  # nothing to protect anyway, so empty files pass through (as in transcrypt).
+  if [ ! -s "$work" ]; then
+    return
+  fi
 
   # Already-encrypted content round-trips untouched, so keyless checkouts
   # can never corrupt (or double-encrypt) an envelope.
@@ -439,7 +445,8 @@ cmd_check() {
   ensure_tmpdir
   local f bad=0 blob="$GLASSINE_TMPDIR/blob"
   while IFS= read -r -d '' f; do
-    if git cat-file blob ":$f" >"$blob" 2>/dev/null && ! is_envelope "$blob"; then
+    # Empty blobs pass through unencrypted by design — nothing to protect.
+    if git cat-file blob ":$f" >"$blob" 2>/dev/null && [ -s "$blob" ] && ! is_envelope "$blob"; then
       printf 'glassine: NOT ENCRYPTED in index: %s\n' "$f" >&2
       bad=1
     fi
@@ -453,7 +460,13 @@ cmd_status() {
   while IFS= read -r -d '' f; do
     state='not-staged'
     if git cat-file blob ":$f" >"$blob" 2>/dev/null; then
-      if is_envelope "$blob"; then state='encrypted'; else state='PLAINTEXT'; fi
+      if is_envelope "$blob"; then
+        state='encrypted'
+      elif [ ! -s "$blob" ]; then
+        state='empty'
+      else
+        state='PLAINTEXT'
+      fi
     fi
     printf '%-11s %s\n' "$state" "$f"
   done < <(managed_files)
