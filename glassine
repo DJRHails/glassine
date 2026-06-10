@@ -10,7 +10,7 @@
 # https://github.com/DJRHails/glassine
 set -euo pipefail
 
-readonly VERSION='0.1.0'
+readonly VERSION='0.2.0'
 
 GLASSINE_TMPDIR=''
 
@@ -133,6 +133,37 @@ cmd_textconv() { # <file>
   cat "$file"
 }
 
+# merge: three-way merge in plaintext space. git stores %A's bytes verbatim
+# as the resolution (clean is NOT applied), so on success we must re-encrypt;
+# on conflict we leave plaintext with markers — the user resolves in the
+# working tree and their `git add` re-encrypts.
+cmd_merge() { # <base %O> <ours %A> <theirs %B> <marker-size %L> <path %P>
+  [ $# -eq 5 ] || die 'usage (git-internal): glassine merge %O %A %B %L %P'
+  local base=$1 ours=$2 theirs=$3 marker=$4 path=$5
+  need_sops
+  ensure_tmpdir
+
+  local f plain="$GLASSINE_TMPDIR/merge_plain"
+  for f in "$base" "$ours" "$theirs"; do
+    if [ -s "$f" ] && is_envelope "$f"; then
+      if decrypt_to "$f" "$plain" "$path"; then
+        cat "$plain" >"$f"
+      else
+        warn "cannot decrypt $path on this host — merging at ciphertext level"
+      fi
+    fi
+  done
+
+  if git merge-file --marker-size="$marker" -L ours -L base -L theirs \
+    "$ours" "$base" "$theirs" >/dev/null 2>&1; then
+    sops encrypt --filename-override "$path" "$ours" >"$GLASSINE_TMPDIR/merge_enc" ||
+      die "re-encryption after merge failed for '$path'"
+    cat "$GLASSINE_TMPDIR/merge_enc" >"$ours"
+    return 0
+  fi
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # repository commands
 # ---------------------------------------------------------------------------
@@ -148,6 +179,182 @@ managed_files() {
     done
 }
 
+# ---------------------------------------------------------------------------
+# recipient management (.sops.yaml)
+#
+# glassine generates a single catch-all creation rule: WHICH files are
+# protected is decided solely by .gitattributes (glassine protect), so
+# .sops.yaml only answers WHO may read. Auto-editing is gated on the
+# "managed by glassine" marker — hand-written files are never rewritten.
+# ---------------------------------------------------------------------------
+
+sops_yaml_managed() { # <file>
+  head -1 "$1" 2>/dev/null | grep -q 'managed by glassine'
+}
+
+create_sops_yaml() { # <file>
+  cat >"$1" <<'EOF'
+# managed by glassine — edit recipients via `glassine allow` / `glassine revoke`
+creation_rules:
+  - key_groups:
+      - age:
+EOF
+}
+
+# Append one recipient under the first `- age:` list. Returns 1 on duplicate.
+add_recipient() { # <file> <key> <comment>
+  local file=$1 key=$2 comment=$3 tmp
+  if grep -qF "$key" "$file"; then
+    warn "already a recipient: ${comment:-$key}"
+    return 1
+  fi
+  ensure_tmpdir
+  tmp="$GLASSINE_TMPDIR/sops_yaml"
+  awk -v line="          - '${key}'${comment:+ # ${comment}}" '
+    { print }
+    !done && $0 ~ /- age:[[:space:]]*$/ { print line; done = 1 }
+  ' "$file" >"$tmp"
+  cat "$tmp" >"$file"
+}
+
+# Resolve one allow argument into "key<TAB>comment" lines on stdout.
+# Accepts a literal key, a path to a .pub file, or github:<user>.
+resolve_recipients() { # <arg>
+  local arg=$1 t b _rest user found=0
+  case "$arg" in
+  github:*)
+    user=${arg#github:}
+    command -v curl >/dev/null 2>&1 || die 'curl is required for github:<user> recipients'
+    while read -r t b _rest; do
+      case "$t" in
+      ssh-ed25519 | ssh-rsa)
+        printf '%s %s\tgithub:%s\n' "$t" "$b" "$user"
+        found=1
+        ;;
+      esac
+    done < <(curl -fsSL "https://github.com/${user}.keys" 2>/dev/null || true)
+    [ "$found" -eq 1 ] || die "no usable SSH keys at github.com/${user}.keys"
+    ;;
+  ssh-ed25519\ * | ssh-rsa\ *)
+    read -r t b _rest <<<"$arg"
+    printf '%s %s\t%s\n' "$t" "$b" "${_rest:-}"
+    ;;
+  age1*)
+    printf '%s\t\n' "$arg"
+    ;;
+  *)
+    [ -f "$arg" ] || die "not a key, key file, or github:<user>: $arg"
+    read -r t b _rest <"$arg"
+    case "$t" in
+    ssh-ed25519 | ssh-rsa) printf '%s %s\t%s\n' "$t" "$b" "${_rest:-$arg}" ;;
+    *) die "unsupported key type '$t' in $arg (age accepts ssh-ed25519 and ssh-rsa)" ;;
+    esac
+    ;;
+  esac
+}
+
+# Re-encrypt staged managed files if there are any (used after ACL changes).
+rotate_if_managed() {
+  local f
+  while IFS= read -r -d '' f; do
+    cmd_rotate
+    return
+  done < <(managed_files)
+}
+
+cmd_allow() { # <key | path/to/key.pub | github:user>...
+  [ $# -gt 0 ] || die 'usage: glassine allow <ssh-pubkey | key-file.pub | github:user>...'
+  local root
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || die 'not inside a git repository'
+  need_sops
+  ensure_tmpdir
+
+  local recips="$GLASSINE_TMPDIR/recips" arg
+  : >"$recips"
+  for arg in "$@"; do
+    resolve_recipients "$arg" >>"$recips"
+  done
+  [ -s "$recips" ] || die 'no recipients resolved'
+
+  local sops_yaml="$root/.sops.yaml"
+  if [ ! -f "$sops_yaml" ]; then
+    create_sops_yaml "$sops_yaml"
+  elif ! sops_yaml_managed "$sops_yaml"; then
+    die '.sops.yaml is not managed by glassine — add recipients there manually'
+  fi
+
+  local key comment added=0
+  while IFS=$'\t' read -r key comment; do
+    if add_recipient "$sops_yaml" "$key" "$comment"; then
+      printf 'glassine: allowed %s\n' "${comment:-$key}"
+      added=$((added + 1))
+    fi
+  done <"$recips"
+
+  if [ "$added" -gt 0 ]; then
+    rotate_if_managed
+  fi
+}
+
+cmd_revoke() { # <pattern>
+  [ $# -eq 1 ] || die 'usage: glassine revoke <pattern matching a recipient line>'
+  local pattern=$1 root
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || die 'not inside a git repository'
+  need_sops
+  local sops_yaml="$root/.sops.yaml"
+  [ -f "$sops_yaml" ] || die 'no .sops.yaml in this repository'
+  sops_yaml_managed "$sops_yaml" || die '.sops.yaml is not managed by glassine — remove recipients there manually'
+
+  ensure_tmpdir
+  local tmp="$GLASSINE_TMPDIR/sops_yaml" removed remaining
+  # Recipient lines look like:       - 'ssh-ed25519 AAAA...' # comment
+  removed=$(grep -cE "^[[:space:]]+- '.*${pattern}" "$sops_yaml" || true)
+  [ "$removed" -gt 0 ] || die "no recipient matches: $pattern"
+  awk -v pat="$pattern" '
+    $0 ~ /^[[:space:]]+- '\''/ && $0 ~ pat { next }
+    { print }
+  ' "$sops_yaml" >"$tmp"
+  remaining=$(grep -cE "^[[:space:]]+- '" "$tmp" || true)
+  [ "$remaining" -gt 0 ] || die "refusing to remove the last recipient ($pattern matches all of them)"
+  cat "$tmp" >"$sops_yaml"
+  printf 'glassine: revoked %d recipient(s) matching %s\n' "$removed" "$pattern"
+
+  rotate_if_managed
+  warn 'revocation is forward-only: the revoked key keeps history it could already read — rotate the secret values too if this was a compromise'
+}
+
+cmd_protect() { # <glob>...
+  [ $# -gt 0 ] || die "usage: glassine protect <glob>...  (e.g. glassine protect 'secrets/**')"
+  local root
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || die 'not inside a git repository'
+  need_sops
+
+  local attrs="$root/.gitattributes" g line
+  for g in "$@"; do
+    line="$g filter=glassine diff=glassine merge=glassine"
+    if [ -f "$attrs" ] && grep -qxF "$line" "$attrs"; then
+      warn "already protected: $g"
+      continue
+    fi
+    printf '%s\n' "$line" >>"$attrs"
+    printf 'glassine: protecting %s\n' "$g"
+  done
+
+  # Encrypt any already-tracked plaintext now covered by the new globs.
+  ensure_tmpdir
+  local f blob="$GLASSINE_TMPDIR/blob" reencrypted=0
+  while IFS= read -r -d '' f; do
+    if git cat-file blob ":$f" >"$blob" 2>/dev/null && ! is_envelope "$blob"; then
+      git add --renormalize -- "$f"
+      reencrypted=$((reencrypted + 1))
+    fi
+  done < <(managed_files)
+  if [ "$reencrypted" -gt 0 ]; then
+    printf 'glassine: re-staged %d previously-plaintext file(s) encrypted — review and commit\n' "$reencrypted"
+    warn 'their plaintext remains in earlier commits; rotate those secret values if sensitive'
+  fi
+}
+
 cmd_init() {
   local root
   root=$(git rev-parse --show-toplevel 2>/dev/null) || die 'not inside a git repository'
@@ -161,15 +368,27 @@ cmd_init() {
   # stage plaintext when the filter errors.
   git config filter.glassine.required true
   git config diff.glassine.textconv 'glassine textconv'
+  git config merge.glassine.name 'glassine three-way merge of sops envelopes'
+  git config merge.glassine.driver 'glassine merge %O %A %B %L %P'
 
-  [ -f "$root/.sops.yaml" ] || warn \
-    'no .sops.yaml found — create one, e.g.:
-  creation_rules:
-    - path_regex: secrets/.*
-      key_groups:
-        - age:
-            - "ssh-ed25519 AAAA... host-one"
-            - "ssh-ed25519 AAAA... host-two"'
+  if [ ! -f "$root/.sops.yaml" ]; then
+    local pub='' candidate t b _rest
+    for candidate in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_rsa.pub"; do
+      if [ -f "$candidate" ]; then
+        pub=$candidate
+        break
+      fi
+    done
+    if [ -n "$pub" ]; then
+      create_sops_yaml "$root/.sops.yaml"
+      read -r t b _rest <"$pub"
+      add_recipient "$root/.sops.yaml" "$t $b" "${_rest:-$(hostname)}" || true
+      printf "glassine: created .sops.yaml with this host's key (%s)\n" "$pub"
+      printf 'glassine: add more recipients with: glassine allow <key | key.pub | github:user>\n'
+    else
+      warn 'no .sops.yaml and no ~/.ssh key found — bootstrap recipients with: glassine allow <key>'
+    fi
+  fi
 
   # Refresh worktree copies that are still ciphertext (e.g. right after
   # cloning, before the filter existed). Note: checkout-index bypasses smudge
@@ -186,7 +405,7 @@ cmd_init() {
   [ "$refreshed" -eq 0 ] || printf 'glassine: decrypted %d file(s) into the working tree\n' "$refreshed"
 
   printf 'glassine: filters configured for %s\n' "$root"
-  printf 'glassine: mark paths in .gitattributes, e.g.: secrets/** filter=glassine diff=glassine merge=binary\n'
+  printf "glassine: choose what to protect, e.g.: glassine protect 'secrets/**'\n"
 }
 
 cmd_uninstall() {
@@ -248,24 +467,28 @@ USAGE
   glassine <command> [args]
 
 COMMANDS
-  init         configure this repository's filters (idempotent; decrypts any
-               still-encrypted worktree files, e.g. right after cloning)
-  status       list managed files and their index state
-  check        fail if any staged managed file is unencrypted (pre-commit)
-  rotate [f…]  force re-encryption with fresh data keys under the current
-               .sops.yaml — run after adding/removing recipients, then commit
-  uninstall    remove the filter configuration from this repository
-  version      print version
+  init           configure this repository (idempotent): filters + merge
+                 driver; bootstraps .sops.yaml with this host's SSH key;
+                 decrypts still-encrypted worktree files (e.g. after cloning)
+  protect <g>…   protect globs: writes .gitattributes lines and encrypts any
+                 already-tracked plaintext matches
+  allow <r>…     add recipients: a literal key, a .pub file, or github:user
+                 (fetches github.com/<user>.keys); re-encrypts managed files
+  revoke <pat>   remove recipients matching <pat> and rotate data keys
+                 (forward-only: rotate secret values too on compromise)
+  status         list managed files and their index state
+  check          fail if any staged managed file is unencrypted (pre-commit)
+  rotate [f…]    force re-encryption with fresh data keys under .sops.yaml
+  uninstall      remove the filter configuration from this repository
+  version        print version
 
 INTERNAL (invoked by git)
-  clean <path>     encrypt:   worktree -> repository
-  smudge <path>    decrypt:   repository -> worktree
-  textconv <file>  decrypt a blob for diff display
+  clean / smudge / textconv / merge
 
-SETUP (per repository)
-  1. .sops.yaml      — creation_rules mapping paths to recipients
-  2. .gitattributes  — secrets/** filter=glassine diff=glassine merge=binary
-  3. glassine init
+QUICKSTART (per repository)
+  glassine init
+  glassine protect 'secrets/**'
+  glassine allow github:teammate     # optional
 EOF
 }
 
@@ -276,7 +499,11 @@ main() {
   clean) cmd_clean "$@" ;;
   smudge) cmd_smudge "$@" ;;
   textconv) cmd_textconv "$@" ;;
+  merge) cmd_merge "$@" ;;
   init) cmd_init "$@" ;;
+  protect) cmd_protect "$@" ;;
+  allow) cmd_allow "$@" ;;
+  revoke) cmd_revoke "$@" ;;
   uninstall) cmd_uninstall "$@" ;;
   rotate) cmd_rotate "$@" ;;
   check) cmd_check "$@" ;;

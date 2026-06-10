@@ -173,4 +173,125 @@ as_host hosta glassine check ||
   fail 'check failed on a fully-encrypted repo'
 ok 'check flags unfiltered plaintext and passes clean repos'
 
+# --- 8: init bootstraps .sops.yaml; protect scopes; catch-all encrypts --------
+
+HOME2="$WORK/home2"
+mkdir -p "$HOME2/.ssh"
+ssh-keygen -t ed25519 -N '' -C 'dh@auto' -f "$HOME2/.ssh/id_ed25519" -q
+AUTO="$WORK/auto"
+mkdir -p "$AUTO"
+(
+  cd "$AUTO"
+  git_q init
+  git config user.name test && git config user.email test@example.invalid
+  HOME=$HOME2 glassine init >/dev/null
+  grep -q 'managed by glassine' .sops.yaml ||
+    fail 'init did not bootstrap a managed .sops.yaml'
+  grep -qF "$(cut -d' ' -f2 "$HOME2/.ssh/id_ed25519.pub")" .sops.yaml ||
+    fail "bootstrapped .sops.yaml is missing the host's key"
+  HOME=$HOME2 glassine protect 'secrets/**' >/dev/null
+  grep -qF 'secrets/** filter=glassine diff=glassine merge=glassine' .gitattributes ||
+    fail 'protect did not write the .gitattributes line'
+  mkdir secrets && echo 'tok: abc' >secrets/a.yaml
+  HOME=$HOME2 git add .
+  git cat-file blob :secrets/a.yaml | grep -q 'ENC\[AES256_GCM' ||
+    fail 'catch-all creation rule did not encrypt'
+  HOME=$HOME2 git commit -qm base
+)
+ok 'init bootstraps .sops.yaml; protect scopes; catch-all rule encrypts'
+
+# --- 9: protect re-encrypts already-tracked plaintext --------------------------
+
+(
+  cd "$AUTO"
+  echo 'TOKEN=plain-oops' >app.env
+  HOME=$HOME2 git add app.env && HOME=$HOME2 git commit -qm 'plaintext env'
+  HOME=$HOME2 glassine protect 'app.env' >/dev/null 2>&1
+  git cat-file blob :app.env | grep -q 'sops_mac=ENC\[' ||
+    fail 'protect did not re-encrypt tracked plaintext'
+  HOME=$HOME2 git commit -qm 'encrypt app.env'
+)
+ok 'protect re-encrypts already-tracked plaintext files'
+
+# --- 10: allow adds a recipient and grants access -------------------------------
+
+ssh-keygen -t ed25519 -N '' -C 'dh@hostc' -f "$WORK/keys/hostc" -q
+(
+  cd "$AUTO"
+  HOME=$HOME2 glassine allow "$WORK/keys/hostc.pub" >/dev/null
+  grep -qF "$(cut -d' ' -f2 "$WORK/keys/hostc.pub")" .sops.yaml ||
+    fail 'allow did not record the new recipient'
+  git cat-file blob :secrets/a.yaml >"$WORK/granted.enc"
+  as_host hostc sops decrypt --filename-override secrets/a.yaml "$WORK/granted.enc" >/dev/null 2>&1 ||
+    fail 'new recipient cannot decrypt after allow'
+  HOME=$HOME2 git commit -qm 'allow hostc'
+)
+ok 'allow records recipient and auto-rotates to grant access'
+
+# --- 11: revoke removes access; refuses to remove the last recipient -----------
+
+(
+  cd "$AUTO"
+  HOME=$HOME2 glassine revoke hostc >/dev/null 2>&1
+  grep -qF "$(cut -d' ' -f2 "$WORK/keys/hostc.pub")" .sops.yaml &&
+    fail 'revoke left the recipient in .sops.yaml'
+  git cat-file blob :secrets/a.yaml >"$WORK/revoked.enc"
+  if as_host hostc sops decrypt --filename-override secrets/a.yaml "$WORK/revoked.enc" >/dev/null 2>&1; then
+    fail 'revoked recipient can still decrypt'
+  fi
+  if HOME=$HOME2 glassine revoke 'ssh-ed25519' >/dev/null 2>&1; then
+    fail 'revoke removed the last recipient'
+  fi
+  HOME=$HOME2 git commit -qm 'revoke hostc'
+)
+ok 'revoke removes access and protects the last recipient'
+
+# --- 12: merge driver — clean three-way merge in plaintext ----------------------
+# Every git call that can trigger filters needs the test identity (HOME):
+# clean's memoisation must decrypt the staged envelope to prove equality.
+
+g2() { HOME=$HOME2 git "$@"; }
+
+(
+  cd "$AUTO"
+  printf 'a: 1\nc1: x\nc2: x\nc3: x\nb: 1\n' >secrets/m.yaml
+  g2 add secrets/m.yaml && g2 commit -qm 'merge base'
+  g2 checkout -q -b side
+  printf 'a: 2\nc1: x\nc2: x\nc3: x\nb: 1\n' >secrets/m.yaml
+  g2 add secrets/m.yaml && g2 commit -qm 'side: a=2'
+  g2 checkout -q -
+  printf 'a: 1\nc1: x\nc2: x\nc3: x\nb: 2\n' >secrets/m.yaml
+  g2 add secrets/m.yaml && g2 commit -qm 'main: b=2'
+  g2 merge -q side -m merged 2>/dev/null ||
+    fail 'non-overlapping merge conflicted'
+  grep -q 'a: 2' secrets/m.yaml || fail 'merge lost the side change'
+  grep -q 'b: 2' secrets/m.yaml || fail 'merge lost the main change'
+  git cat-file blob HEAD:secrets/m.yaml | grep -q 'ENC\[AES256_GCM' ||
+    fail 'merged blob is not encrypted'
+)
+ok 'merge driver: clean 3-way merge in plaintext, re-encrypted result'
+
+# --- 13: merge driver — conflicts surface as plaintext markers ------------------
+
+(
+  cd "$AUTO"
+  g2 checkout -q -b side2
+  printf 'a: 9\nc1: x\nc2: x\nc3: x\nb: 2\n' >secrets/m.yaml
+  g2 add secrets/m.yaml && g2 commit -qm 'side2: a=9'
+  g2 checkout -q -
+  printf 'a: 7\nc1: x\nc2: x\nc3: x\nb: 2\n' >secrets/m.yaml
+  g2 add secrets/m.yaml && g2 commit -qm 'main: a=7'
+  if g2 merge -q side2 -m conflict 2>/dev/null; then
+    fail 'overlapping merge did not conflict'
+  fi
+  grep -q '^<<<<<<<' secrets/m.yaml || fail 'conflict markers missing'
+  grep -q 'a: 9' secrets/m.yaml || fail 'theirs side missing from conflict'
+  grep -q 'a: 7' secrets/m.yaml || fail 'ours side missing from conflict'
+  printf 'a: 8\nc1: x\nc2: x\nc3: x\nb: 2\n' >secrets/m.yaml
+  g2 add secrets/m.yaml && g2 commit -qm resolved
+  git cat-file blob HEAD:secrets/m.yaml | grep -q 'ENC\[AES256_GCM' ||
+    fail 'resolved blob is not encrypted'
+)
+ok 'merge driver: conflicts are plaintext; resolution re-encrypts'
+
 printf '\nall %d tests passed\n' "$PASS"
