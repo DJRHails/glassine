@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+#
+# glassine — transparent sops-backed encryption for git
+#
+# Glassine is the translucent archival paper used to protect valuable
+# documents. This tool keeps sops envelopes in your git history while your
+# working tree holds plaintext: opaque to the remote, transparent to anyone
+# holding a key.
+#
+# https://github.com/DJRHails/glassine
+set -euo pipefail
+
+readonly VERSION='0.1.0'
+
+GLASSINE_TMPDIR=''
+
+die() {
+  printf 'glassine: %s\n' "$*" >&2
+  exit 1
+}
+
+warn() {
+  printf 'glassine: %s\n' "$*" >&2
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+ensure_tmpdir() {
+  if [ -z "$GLASSINE_TMPDIR" ]; then
+    GLASSINE_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/glassine.XXXXXX")
+    trap 'rm -rf -- "${GLASSINE_TMPDIR:?}"' EXIT
+  fi
+}
+
+# A sops envelope always carries a MAC over its contents in its metadata,
+# regardless of input type:
+#   YAML:   mac: ENC[AES256_GCM,...      JSON: "mac": "ENC[AES256_GCM,...
+#   dotenv: sops_mac=ENC[AES256_GCM,...  ini:  mac = ENC[AES256_GCM,...
+# Matching on that is key-independent, so keyless hosts can recognise
+# ciphertext too. (-a treats binary content as text.)
+is_envelope() {
+  LC_ALL=C grep -aqE 'mac[^[:alnum:]]{1,4}ENC\[AES256_GCM' "$1"
+}
+
+# Decrypt src into dst, presenting the repo-relative path to sops so that
+# input-type detection and .sops.yaml creation rules behave as if the file
+# were at its real location.
+decrypt_to() { # <src> <dst> <repo-relative-path>
+  sops decrypt --filename-override "$3" "$1" >"$2" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# git filter hooks
+# ---------------------------------------------------------------------------
+
+# clean: plaintext from stdin -> envelope on stdout (worktree -> repository).
+#
+# sops output is randomised (fresh data key, IVs, lastmodified, MAC), but git
+# requires clean to be a pure function or every `git status` dirties the
+# file. We restore purity by memoising against the index: when the staged
+# envelope decrypts to exactly the incoming plaintext, re-emit it unchanged.
+cmd_clean() { # <repo-relative-path>
+  local path=$1
+  require_cmd sops
+  ensure_tmpdir
+  local work="$GLASSINE_TMPDIR/work"
+  cat >"$work"
+
+  # Already-encrypted content round-trips untouched, so keyless checkouts
+  # can never corrupt (or double-encrypt) an envelope.
+  if is_envelope "$work"; then
+    cat "$work"
+    return
+  fi
+
+  if [ "${GLASSINE_FORCE:-0}" != '1' ]; then
+    local staged="$GLASSINE_TMPDIR/staged" staged_plain="$GLASSINE_TMPDIR/staged_plain"
+    if git cat-file blob ":$path" >"$staged" 2>/dev/null && is_envelope "$staged"; then
+      if decrypt_to "$staged" "$staged_plain" "$path" && cmp -s "$staged_plain" "$work"; then
+        cat "$staged"
+        return
+      fi
+    fi
+  fi
+
+  # Real change (or forced rotation): fresh envelope, fresh data key.
+  sops encrypt --filename-override "$path" "$work" ||
+    die "encryption failed for '$path' — do .sops.yaml creation_rules cover this path?"
+}
+
+# smudge: envelope from stdin -> plaintext on stdout (repository -> worktree).
+# Never fails: hosts without a matching identity get the envelope verbatim,
+# which clean passes back through unchanged.
+cmd_smudge() { # <repo-relative-path>
+  local path=$1
+  ensure_tmpdir
+  local work="$GLASSINE_TMPDIR/work" plain="$GLASSINE_TMPDIR/plain"
+  cat >"$work"
+  if command -v sops >/dev/null 2>&1 && decrypt_to "$work" "$plain" "$path"; then
+    cat "$plain"
+  else
+    cat "$work"
+  fi
+}
+
+# textconv: decrypt a blob for diff display. git hands us a bare temporary
+# file with the original extension lost, so probe likely input types.
+cmd_textconv() { # <file>
+  local file=$1 t
+  if command -v sops >/dev/null 2>&1; then
+    for t in json yaml dotenv ini binary; do
+      if sops decrypt --input-type "$t" --output-type "$t" "$file" 2>/dev/null; then
+        return
+      fi
+    done
+  fi
+  cat "$file"
+}
+
+# ---------------------------------------------------------------------------
+# repository commands
+# ---------------------------------------------------------------------------
+
+# Tracked paths whose filter attribute is glassine, NUL-separated on stdout.
+managed_files() {
+  git ls-files -z |
+    git check-attr --stdin -z filter |
+    while IFS= read -r -d '' p && IFS= read -r -d '' _ && IFS= read -r -d '' v; do
+      if [ "$v" = 'glassine' ]; then
+        printf '%s\0' "$p"
+      fi
+    done
+}
+
+cmd_init() {
+  local root
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || die 'not inside a git repository'
+  require_cmd sops
+  command -v glassine >/dev/null 2>&1 ||
+    warn 'glassine is not on PATH; the filters below will fail until it is'
+
+  git config filter.glassine.clean 'glassine clean %f'
+  git config filter.glassine.smudge 'glassine smudge %f'
+  # A failing clean must abort the operation; without this git would silently
+  # stage plaintext when the filter errors.
+  git config filter.glassine.required true
+  git config diff.glassine.textconv 'glassine textconv'
+
+  [ -f "$root/.sops.yaml" ] || warn \
+    'no .sops.yaml found — create one, e.g.:
+  creation_rules:
+    - path_regex: secrets/.*
+      key_groups:
+        - age:
+            - "ssh-ed25519 AAAA... host-one"
+            - "ssh-ed25519 AAAA... host-two"'
+
+  # Refresh worktree copies that are still ciphertext (e.g. right after
+  # cloning, before the filter existed). Note: checkout-index bypasses smudge
+  # filters, so delete + checkout is the reliable re-smudge idiom.
+  ensure_tmpdir
+  local f refreshed=0
+  while IFS= read -r -d '' f; do
+    if [ -f "$root/$f" ] && is_envelope "$root/$f"; then
+      rm -f -- "$root/$f"
+      git checkout -- "$f"
+      refreshed=$((refreshed + 1))
+    fi
+  done < <(managed_files)
+  [ "$refreshed" -eq 0 ] || printf 'glassine: decrypted %d file(s) into the working tree\n' "$refreshed"
+
+  printf 'glassine: filters configured for %s\n' "$root"
+  printf 'glassine: mark paths in .gitattributes, e.g.: secrets/** filter=glassine diff=glassine merge=binary\n'
+}
+
+cmd_uninstall() {
+  git rev-parse --show-toplevel >/dev/null 2>&1 || die 'not inside a git repository'
+  git config --remove-section filter.glassine 2>/dev/null || true
+  git config --remove-section diff.glassine 2>/dev/null || true
+  warn 'filters removed; working-tree plaintext is untouched but future checkouts produce ciphertext'
+}
+
+# Force re-encryption with fresh data keys under the current .sops.yaml.
+# Run after changing recipients: removing a recipient without rotating only
+# stops them reading *future* envelopes once content changes — this command
+# makes the cut immediate and mints new data keys (sops rotate semantics).
+cmd_rotate() { # [paths...]
+  local files=()
+  if [ $# -gt 0 ]; then
+    files=("$@")
+  else
+    local f
+    while IFS= read -r -d '' f; do files+=("$f"); done < <(managed_files)
+  fi
+  [ ${#files[@]} -gt 0 ] || die 'no glassine-managed files found (set "filter=glassine" in .gitattributes)'
+  GLASSINE_FORCE=1 git add --renormalize -- "${files[@]}"
+  printf 'glassine: re-encrypted %d file(s) with fresh data keys — review and commit\n' "${#files[@]}"
+}
+
+# Verify every staged managed file is an envelope. Run as a pre-commit hook
+# to catch the classic filter failure: .gitattributes says filter=glassine
+# but the driver is missing from git config, so git silently skips it.
+cmd_check() {
+  ensure_tmpdir
+  local f bad=0 blob="$GLASSINE_TMPDIR/blob"
+  while IFS= read -r -d '' f; do
+    if git cat-file blob ":$f" >"$blob" 2>/dev/null && ! is_envelope "$blob"; then
+      printf 'glassine: NOT ENCRYPTED in index: %s\n' "$f" >&2
+      bad=1
+    fi
+  done < <(managed_files)
+  [ "$bad" -eq 0 ] || die 'plaintext staged for managed paths — run "glassine init" then "glassine rotate"'
+}
+
+cmd_status() {
+  ensure_tmpdir
+  local f state blob="$GLASSINE_TMPDIR/blob"
+  while IFS= read -r -d '' f; do
+    state='not-staged'
+    if git cat-file blob ":$f" >"$blob" 2>/dev/null; then
+      if is_envelope "$blob"; then state='encrypted'; else state='PLAINTEXT'; fi
+    fi
+    printf '%-11s %s\n' "$state" "$f"
+  done < <(managed_files)
+}
+
+usage() {
+  cat <<'EOF'
+glassine — transparent sops-backed encryption for git
+
+USAGE
+  glassine <command> [args]
+
+COMMANDS
+  init         configure this repository's filters (idempotent; decrypts any
+               still-encrypted worktree files, e.g. right after cloning)
+  status       list managed files and their index state
+  check        fail if any staged managed file is unencrypted (pre-commit)
+  rotate [f…]  force re-encryption with fresh data keys under the current
+               .sops.yaml — run after adding/removing recipients, then commit
+  uninstall    remove the filter configuration from this repository
+  version      print version
+
+INTERNAL (invoked by git)
+  clean <path>     encrypt:   worktree -> repository
+  smudge <path>    decrypt:   repository -> worktree
+  textconv <file>  decrypt a blob for diff display
+
+SETUP (per repository)
+  1. .sops.yaml      — creation_rules mapping paths to recipients
+  2. .gitattributes  — secrets/** filter=glassine diff=glassine merge=binary
+  3. glassine init
+EOF
+}
+
+main() {
+  local cmd=${1:-help}
+  shift || true
+  case "$cmd" in
+  clean) cmd_clean "$@" ;;
+  smudge) cmd_smudge "$@" ;;
+  textconv) cmd_textconv "$@" ;;
+  init) cmd_init "$@" ;;
+  uninstall) cmd_uninstall "$@" ;;
+  rotate) cmd_rotate "$@" ;;
+  check) cmd_check "$@" ;;
+  status) cmd_status "$@" ;;
+  version | --version | -v) printf 'glassine %s\n' "$VERSION" ;;
+  help | --help | -h) usage ;;
+  *) die "unknown command: $cmd (try: glassine help)" ;;
+  esac
+}
+
+main "$@"
