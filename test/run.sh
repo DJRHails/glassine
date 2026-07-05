@@ -546,4 +546,26 @@ ok 'git archive applies smudge: tarballs from keyed hosts hold plaintext'
 )
 ok 'symlinks are stored raw: targets are never encrypted'
 
+# --- 28: check advises (non-fatally) on binary content, not on text -------------
+# Binary secrets round-trip (test 15), but an encrypted binary can't diff and is
+# the footgun that breaks other crypt filters on PNGs — so `check` warns.
+
+(
+  cd "$(mk_managed binadvise)"
+  # A real PNG header — magic + IHDR length/type — carries NUL bytes, so this
+  # is deterministically "binary" (git's NUL-in-first-8000 heuristic), unlike a
+  # random sample that only *usually* contains a NUL.
+  printf '\211PNG\r\n\032\n\0\0\0\rIHDR\0\0\0\1\0\0\0\1' >secrets/pic.png
+  echo 'k: text' >secrets/note.yaml            # text
+  g3 git add . && g3 git commit -qm 'binary + text'
+  g3 glassine check 2>"$WORK/binchk.err" ||
+    fail 'check must stay non-fatal on binary content'
+  if grep -q 'note.yaml' "$WORK/binchk.err"; then
+    fail 'check wrongly advised on a text file'
+  fi
+  grep -q 'BINARY under glassine: secrets/pic.png' "$WORK/binchk.err" ||
+    fail 'check did not advise on the binary png'
+)
+ok 'check advises non-fatally on binary content, not on text'
+
 printf '\nall %d tests passed\n' "$PASS"
