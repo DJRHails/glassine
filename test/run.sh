@@ -654,4 +654,23 @@ ok 'git config glassine.identity decrypts keys at non-default paths'
 )
 ok 'glassine.identity expands a literal ~ against HOME'
 
+# --- 33: glassine.identity that cannot resolve -------------------------------------
+# An unexpandable value (~nouser/...) makes `git config --type=path` die with
+# exit 128 ("failed to expand user dir"); glassine must catch that, warn with
+# the verbatim configured value (the hand-rolled expansion printed a mangled
+# ${HOME}nouser/... path instead), and keep git operations working rather than
+# letting the failure kill the filter.
+
+(
+  cd "$IDCLONE"
+  # shellcheck disable=SC2088 # the unexpandable tilde is the case under test
+  git config glassine.identity '~glassine-nouser/id_github'
+  touch secrets/creds.yaml
+  HOME="$WORK/nokeys" git status --porcelain >/dev/null 2>"$WORK/idwarn.err" ||
+    fail 'git status must survive an unresolvable glassine.identity'
+  grep -qF '~glassine-nouser/id_github' "$WORK/idwarn.err" ||
+    fail 'identity warning does not quote the verbatim configured value'
+)
+ok 'unresolvable glassine.identity warns verbatim and degrades gracefully'
+
 printf '\nall %d tests passed\n' "$PASS"
