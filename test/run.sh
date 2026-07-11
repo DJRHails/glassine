@@ -638,4 +638,20 @@ git_q clone "$ORIGIN" "$IDCLONE"
 )
 ok 'git config glassine.identity decrypts keys at non-default paths'
 
+# --- 32: glassine.identity stored with a literal '~' ------------------------------
+# A quoted `git config glassine.identity '~/key'` stores the tilde verbatim;
+# glassine reads the value with --type=path so git's own expansion resolves it
+# against $HOME (the hand-rolled substitute mangled ~user/... paths).
+
+(
+  cd "$IDCLONE"
+  cp "$WORK/keys/hosta" "$WORK/nokeys/id_github"
+  # shellcheck disable=SC2088 # the unexpanded tilde is the case under test
+  git config glassine.identity '~/id_github' # stored verbatim, expanded at read time
+  touch secrets/creds.yaml
+  [ -z "$(HOME="$WORK/nokeys" git status --porcelain)" ] ||
+    fail 'literal-~ glassine.identity did not resolve against HOME'
+)
+ok 'glassine.identity expands a literal ~ against HOME'
+
 printf '\nall %d tests passed\n' "$PASS"

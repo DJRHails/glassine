@@ -47,7 +47,9 @@ Then just work: files under `secrets/` are plaintext in your tree and
 envelopes in every commit. `git diff` shows plaintext, merges happen in
 plaintext. Hosts decrypt with their own `~/.ssh/id_ed25519` — no extra key
 material (sops auto-discovers it; override with
-`SOPS_AGE_SSH_PRIVATE_KEY_FILE`).
+`SOPS_AGE_SSH_PRIVATE_KEY_FILE`). A key at any other path (say
+`~/.ssh/id_github`) needs `git config glassine.identity <path>`, since sops
+probes only the two default names.
 
 On a fresh clone, `glassine init` decrypts the working tree in place.
 Keyless clones simply see envelopes — they round-trip safely and can never
