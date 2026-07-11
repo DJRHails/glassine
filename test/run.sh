@@ -536,6 +536,9 @@ ok 'git worktree add decrypts secrets in the new worktree'
 ok 'git archive applies smudge: tarballs from keyed hosts hold plaintext'
 
 # --- 27: symlinks bypass filters (documented behavior) ----------------------------------
+# Filters never run on symlinks, so glassine does not manage them: rotate,
+# check, and status must all ignore the link instead of raising false alarms
+# (phantom drift / NOT ENCRYPTED / PLAINTEXT).
 
 (
   cd "$(mk_managed symlink)"
@@ -543,8 +546,15 @@ ok 'git archive applies smudge: tarballs from keyed hosts hold plaintext'
   g3 git add secrets/link.yaml && g3 git commit -qm link
   [ "$(git cat-file blob :secrets/link.yaml)" = 's.yaml' ] ||
     fail 'symlink behavior changed: expected raw target in blob'
+  g3 glassine rotate >/dev/null 2>&1 ||
+    fail 'rotate false-fatals on a managed symlink'
+  g3 glassine check >/dev/null 2>&1 ||
+    fail 'check false-flags a managed symlink as plaintext'
+  if g3 glassine status | grep -q 'link.yaml'; then
+    fail 'status lists an unmanageable symlink'
+  fi
 )
-ok 'symlinks are stored raw: targets are never encrypted'
+ok 'symlinks are stored raw and exempt from rotate/check/status'
 
 # --- 28: check advises (non-fatally) on binary content, not on text -------------
 # Binary secrets round-trip (test 15), but an encrypted binary can't diff and is
@@ -617,5 +627,23 @@ mkdir -p "$WORK/nokeys"
   fi
 )
 ok 'keyless allow/rotate fails loudly instead of claiming re-encryption'
+
+# --- 31: rotate before init fails with guidance, not a false report ---------------
+# With no filter configured, renormalize is a no-op and the staged blobs stay
+# plaintext. Rotate must fail loudly pointing at init — not exit 0 claiming
+# undecryptable ciphertext, and not claim recipient drift.
+
+(
+  cd "$BARE"
+  if glassine rotate >/dev/null 2>"$WORK/rotbare.err"; then
+    fail 'rotate claimed success though the filter never encrypted anything'
+  fi
+  grep -q 'glassine init' "$WORK/rotbare.err" ||
+    fail 'unfiltered rotate failure lacks init guidance'
+  if grep -q 'recipients changed' "$WORK/rotbare.err"; then
+    fail 'unfiltered rotate misreported as recipient drift'
+  fi
+)
+ok 'rotate before init fails with init guidance instead of a false report'
 
 printf '\nall %d tests passed\n' "$PASS"
