@@ -10,7 +10,7 @@
 # https://github.com/DJRHails/glassine
 set -euo pipefail
 
-readonly VERSION='0.5.0'
+readonly VERSION='0.5.1'
 
 GLASSINE_TMPDIR=''
 
@@ -83,23 +83,23 @@ decrypt_to() { # <src> <dst> <repo-relative-path>
 # sops only probes ~/.ssh/id_ed25519 and ~/.ssh/id_rsa for SSH identities, so
 # a key at any other path (common: per-service names like ~/.ssh/id_github)
 # silently fails to decrypt. `git config glassine.identity <path>` names the
-# key per repository+machine; an explicit SOPS_AGE_SSH_PRIVATE_KEY_FILE in the
-# environment always wins.
+# key per repository+machine (--type=path applies git's own ~ expansion); an
+# explicit SOPS_AGE_SSH_PRIVATE_KEY_FILE in the environment always wins.
 maybe_export_identity() {
   [ -z "${SOPS_AGE_SSH_PRIVATE_KEY_FILE:-}" ] || return 0
-  local id
-  id=$(git config glassine.identity 2>/dev/null) || return 0
-  id=${id/#\~/$HOME}
-  [ -f "$id" ] || {
-    warn "glassine.identity points at a missing file: $id"
+  local raw id
+  raw=$(git config glassine.identity 2>/dev/null) || return 0
+  if ! id=$(git config --type=path glassine.identity 2>/dev/null) || [ ! -f "$id" ]; then
+    warn "glassine.identity does not resolve to a key file: $raw"
     return 0
-  }
+  fi
   export SOPS_AGE_SSH_PRIVATE_KEY_FILE=$id
 }
 
 # True when some decryption identity is plausibly available to sops: an
-# explicit env var, the glassine.identity config, a default SSH key, or an
-# age keys.txt in either the macOS or XDG location.
+# explicit env var (maybe_export_identity has already turned glassine.identity
+# into one — main runs it before dispatching any command), a default SSH key,
+# or an age keys.txt in either the macOS or XDG location.
 has_identity() {
   [ -n "${SOPS_AGE_SSH_PRIVATE_KEY_FILE:-}" ] && return 0
   [ -n "${SOPS_AGE_KEY:-}${SOPS_AGE_KEY_FILE:-}${SOPS_AGE_KEY_CMD:-}" ] && return 0
