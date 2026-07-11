@@ -694,9 +694,11 @@ ssh-keygen -t ed25519 -N '' -C 'dh@decoy' -f "$HOME4/.ssh/id_decoy" -q # never a
   HOME=$HOME4 git add . && HOME=$HOME4 git commit -qm base # encryption needs only public keys
   rm secrets/s.yaml
   git cat-file blob :secrets/s.yaml >secrets/s.yaml # ciphertext worktree, as after a clone
-  # The commit's own re-clean already pinned the key via the scan; unset so
-  # this exercises init's decrypt-and-pin from scratch.
-  git config --unset glassine.identity
+  # The commit usually pins the key already (its racy-clean re-hash re-runs
+  # clean, whose memoisation decrypts via the scan) — but only when git
+  # considers the index entry racy, which is timing-dependent. Unset
+  # tolerantly so this exercises init's decrypt-and-pin from scratch either way.
+  git config --unset glassine.identity 2>/dev/null || true
   HOME=$HOME4 glassine init >/dev/null 2>&1
   grep -q 'k1: scanme' secrets/s.yaml ||
     fail 'scan did not find the recipient-matched key in ~/.ssh'
