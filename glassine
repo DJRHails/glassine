@@ -91,7 +91,8 @@ decrypt_to() { # <src> <dst> <repo-relative-path>
   local pub key material
   for pub in "$HOME"/.ssh/*.pub; do
     key=${pub%.pub}
-    [ -f "$pub" ] && [ -f "$key" ] || continue
+    [ -f "$pub" ] || continue
+    [ -f "$key" ] || continue
     material=$(cut -d' ' -f2 "$pub" 2>/dev/null || true)
     [ -n "$material" ] || continue
     LC_ALL=C grep -aqF "$material" "$1" || continue # not a recipient of this envelope
