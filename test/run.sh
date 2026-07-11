@@ -553,6 +553,13 @@ ok 'git archive applies smudge: tarballs from keyed hosts hold plaintext'
   if g3 glassine status | grep -q 'link.yaml'; then
     fail 'status lists an unmanageable symlink'
   fi
+  if g3 glassine rotate secrets/link.yaml >/dev/null 2>"$WORK/rotlink.err"; then
+    fail 'rotate accepted an explicitly-named symlink'
+  fi
+  grep -q 'no glassine-managed regular files match' "$WORK/rotlink.err" ||
+    fail 'explicit symlink rotate lacks a precise refusal'
+  g3 glassine rotate secrets/link.yaml secrets/s.yaml >/dev/null 2>&1 ||
+    fail 'rotate refused a pathspec mixing a symlink with a managed file'
 )
 ok 'symlinks are stored raw and exempt from rotate/check/status'
 
