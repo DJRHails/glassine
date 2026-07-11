@@ -45,8 +45,11 @@ glassine protect 'secrets/**' # choose what to protect (writes .gitattributes;
 
 Then just work: files under `secrets/` are plaintext in your tree and
 envelopes in every commit. `git diff` shows plaintext, merges happen in
-plaintext. Hosts decrypt with their own `~/.ssh/id_ed25519` — no extra key
-material (sops auto-discovers it; override with
+plaintext. Hosts decrypt with their own SSH keys — no extra key material.
+sops probes `~/.ssh/id_ed25519` and `~/.ssh/id_rsa` itself; for keys under
+any other name (`id_github`, `id_work`, …) glassine scans `~/.ssh` for the
+pair matching the envelope's recipients and pins the winner as
+`git config glassine.identity` (override with
 `SOPS_AGE_SSH_PRIVATE_KEY_FILE`).
 
 On a fresh clone, `glassine init` decrypts the working tree in place.
