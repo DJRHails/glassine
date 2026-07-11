@@ -556,7 +556,7 @@ ok 'symlinks are stored raw: targets are never encrypted'
   # is deterministically "binary" (git's NUL-in-first-8000 heuristic), unlike a
   # random sample that only *usually* contains a NUL.
   printf '\211PNG\r\n\032\n\0\0\0\rIHDR\0\0\0\1\0\0\0\1' >secrets/pic.png
-  echo 'k: text' >secrets/note.yaml            # text
+  echo 'k: text' >secrets/note.yaml # text
   g3 git add . && g3 git commit -qm 'binary + text'
   g3 glassine check 2>"$WORK/binchk.err" ||
     fail 'check must stay non-fatal on binary content'
@@ -567,5 +567,55 @@ ok 'symlinks are stored raw: targets are never encrypted'
     fail 'check did not advise on the binary png'
 )
 ok 'check advises non-fatally on binary content, not on text'
+
+# --- 29: rotate re-mints a still-ciphertext worktree copy on a keyed host --------
+# The post-clone, pre-init state: the worktree holds the envelope, not
+# plaintext. allow → rotate must still deliver the new recipient, and the
+# worktree must come back decrypted.
+
+ssh-keygen -t ed25519 -N '' -C 'dh@extra' -f "$WORK/keys/extra" -q
+(
+  cd "$(mk_managed rotcipher)"
+  rm secrets/s.yaml
+  git cat-file blob :secrets/s.yaml >secrets/s.yaml
+  g3 glassine allow "$WORK/keys/extra.pub" >/dev/null 2>&1 ||
+    fail 'allow failed on a ciphertext-worktree repo with a local key'
+  git cat-file blob :secrets/s.yaml >"$WORK/rotc.enc"
+  grep -qF "$(cut -d' ' -f2 "$WORK/keys/extra.pub")" "$WORK/rotc.enc" ||
+    fail 'rotate did not add the new recipient to a ciphertext-worktree envelope'
+  g3 glassine check >/dev/null 2>&1 || fail 'check reports drift after a keyed rotate'
+  grep -q 'k1: v1' secrets/s.yaml ||
+    fail 'rotate left ciphertext in the worktree on a keyed host'
+)
+ok 'rotate re-mints envelopes from a ciphertext worktree when a key is present'
+
+# --- 30: keyless rotate reports what it cannot re-encrypt -------------------------
+# A host without any recipient key cannot re-mint envelopes. Rotating in a
+# consistent repo warns that data keys were not refreshed (exit 0); granting a
+# new recipient fails loudly instead of claiming re-encryption, and check
+# flags the drift left behind.
+
+ssh-keygen -t ed25519 -N '' -C 'dh@late2' -f "$WORK/keys/late2" -q
+mkdir -p "$WORK/nokeys"
+(
+  cd "$(mk_managed rotkeyless)"
+  rm secrets/s.yaml
+  git cat-file blob :secrets/s.yaml >secrets/s.yaml
+
+  HOME="$WORK/nokeys" glassine rotate >/dev/null 2>"$WORK/rotk1.err" ||
+    fail 'rotate must stay zero-exit when envelopes already match policy'
+  grep -q 'NOT refreshed' "$WORK/rotk1.err" ||
+    fail 'unrotated-but-consistent files were not reported'
+
+  if HOME="$WORK/nokeys" glassine allow "$WORK/keys/late2.pub" >/dev/null 2>"$WORK/rotk2.err"; then
+    fail 'keyless allow claimed success despite unrotated envelopes'
+  fi
+  grep -q 'cannot re-encrypt' "$WORK/rotk2.err" ||
+    fail 'keyless allow/rotate failure is silent'
+  if HOME="$WORK/nokeys" glassine check >/dev/null 2>&1; then
+    fail 'check missed drift after a failed keyless rotate'
+  fi
+)
+ok 'keyless allow/rotate fails loudly instead of claiming re-encryption'
 
 printf '\nall %d tests passed\n' "$PASS"

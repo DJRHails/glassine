@@ -10,7 +10,7 @@
 # https://github.com/DJRHails/glassine
 set -euo pipefail
 
-readonly VERSION='0.3.0'
+readonly VERSION='0.4.0'
 
 GLASSINE_TMPDIR=''
 
@@ -104,10 +104,21 @@ cmd_clean() { # <repo-relative-path>
   fi
 
   # Already-encrypted content round-trips untouched, so keyless checkouts
-  # can never corrupt (or double-encrypt) an envelope.
+  # can never corrupt (or double-encrypt) an envelope. Forced rotation is the
+  # exception: when this host can decrypt the envelope, re-mint it under the
+  # current .sops.yaml; when it can't, pass it through and say so — rotate
+  # turns that miss into a report instead of a false success.
   if is_envelope "$work"; then
-    cat "$work"
-    return
+    local reminted="$GLASSINE_TMPDIR/reminted"
+    if [ "${GLASSINE_FORCE:-0}" = '1' ] && decrypt_to "$work" "$reminted" "$path"; then
+      cat "$reminted" >"$work"
+    else
+      if [ "${GLASSINE_FORCE:-0}" = '1' ]; then
+        warn "cannot rotate '$path': no decryption key on this host"
+      fi
+      cat "$work"
+      return
+    fi
   fi
 
   if [ "${GLASSINE_FORCE:-0}" != '1' ]; then
@@ -455,17 +466,65 @@ cmd_uninstall() {
 # Run after changing recipients: removing a recipient without rotating only
 # stops them reading *future* envelopes once content changes — this command
 # makes the cut immediate and mints new data keys (sops rotate semantics).
+#
+# Re-minting needs the plaintext, so a worktree copy that is still ciphertext
+# only rotates where a local key can decrypt it. Files left behind are
+# reported, never silently skipped: recipient drift is fatal; an envelope that
+# already matches policy but keeps its old data key is a warning.
 cmd_rotate() { # [paths...]
-  local files=()
+  local root
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || die 'not inside a git repository'
+  local files=() f
   if [ $# -gt 0 ]; then
     files=("$@")
   else
-    local f
     while IFS= read -r -d '' f; do files+=("$f"); done < <(managed_files)
   fi
   [ ${#files[@]} -gt 0 ] || die 'no glassine-managed files found (set "filter=glassine" in .gitattributes)'
+
+  local old_hashes=()
+  for f in "${files[@]}"; do
+    old_hashes+=("$(git ls-files -s -- "$f" | awk '{print $2}')")
+  done
+
   GLASSINE_FORCE=1 git add --renormalize -- "${files[@]}"
-  printf 'glassine: re-encrypted %d file(s) with fresh data keys — review and commit\n' "${#files[@]}"
+
+  local policy=''
+  if [ -f "$root/.sops.yaml" ] && sops_yaml_managed "$root/.sops.yaml"; then
+    policy=$(policy_keys "$root/.sops.yaml")
+  fi
+
+  ensure_tmpdir
+  local blob="$GLASSINE_TMPDIR/rotate_blob" i new rotated=0 stale='' drifted=''
+  for i in "${!files[@]}"; do
+    f=${files[$i]}
+    new=$(git ls-files -s -- "$f" | awk '{print $2}')
+    [ -n "$new" ] || continue
+    if [ "$new" != "${old_hashes[$i]}" ]; then
+      rotated=$((rotated + 1))
+      # A fresh envelope over a still-ciphertext worktree copy would dirty the
+      # file forever; refresh the worktree through smudge (init's idiom).
+      if [ -f "$f" ] && is_envelope "$f"; then
+        rm -f -- "$f"
+        git checkout -- "$f"
+      fi
+      continue
+    fi
+    git cat-file blob "$new" >"$blob" 2>/dev/null || continue
+    [ -s "$blob" ] || continue # empty files pass through unencrypted by design
+    if [ -n "$policy" ] && [ "$(envelope_keys "$blob")" != "$policy" ]; then
+      drifted="$drifted $f"
+    else
+      stale="$stale $f"
+    fi
+  done
+
+  [ "$rotated" -eq 0 ] ||
+    printf 'glassine: re-encrypted %d file(s) with fresh data keys — review and commit\n' "$rotated"
+  [ -z "$stale" ] ||
+    warn "data keys NOT refreshed for:$stale — worktree copies are ciphertext this host cannot decrypt"
+  [ -z "$drifted" ] ||
+    die "cannot re-encrypt:$drifted — recipients changed but no local key can decrypt the old envelope; run rotate on a host holding a previous recipient key"
 }
 
 # Verify every staged managed file is an envelope, and (for a glassine-managed
@@ -544,7 +603,9 @@ COMMANDS
   status         list managed files and their index state
   check          fail if any staged managed file is unencrypted (pre-commit);
                  also advises (non-fatally) on binary content under glassine
-  rotate [f…]    force re-encryption with fresh data keys under .sops.yaml
+  rotate [f…]    force re-encryption with fresh data keys under .sops.yaml;
+                 re-mints still-ciphertext worktree copies where a key allows,
+                 and reports the files it cannot re-encrypt
   uninstall      remove the filter configuration from this repository
   version        print version
 
