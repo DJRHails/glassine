@@ -10,7 +10,7 @@
 # https://github.com/DJRHails/glassine
 set -euo pipefail
 
-readonly VERSION='0.4.1'
+readonly VERSION='0.5.1'
 
 GLASSINE_TMPDIR=''
 
@@ -78,6 +78,34 @@ is_binary() { # <file>
 # were at its real location.
 decrypt_to() { # <src> <dst> <repo-relative-path>
   sops decrypt --filename-override "$3" "$1" >"$2" 2>/dev/null
+}
+
+# sops only probes ~/.ssh/id_ed25519 and ~/.ssh/id_rsa for SSH identities, so
+# a key at any other path (common: per-service names like ~/.ssh/id_github)
+# silently fails to decrypt. `git config glassine.identity <path>` names the
+# key per repository+machine; an explicit SOPS_AGE_SSH_PRIVATE_KEY_FILE in the
+# environment always wins.
+maybe_export_identity() {
+  [ -z "${SOPS_AGE_SSH_PRIVATE_KEY_FILE:-}" ] || return 0
+  local id
+  id=$(git config glassine.identity 2>/dev/null) || return 0
+  id=${id/#\~/$HOME}
+  [ -f "$id" ] || {
+    warn "glassine.identity points at a missing file: $id"
+    return 0
+  }
+  export SOPS_AGE_SSH_PRIVATE_KEY_FILE=$id
+}
+
+# True when some decryption identity is plausibly available to sops: an
+# explicit env var, the glassine.identity config, a default SSH key, or an
+# age keys.txt in either the macOS or XDG location.
+has_identity() {
+  [ -n "${SOPS_AGE_SSH_PRIVATE_KEY_FILE:-}" ] && return 0
+  [ -n "${SOPS_AGE_KEY:-}${SOPS_AGE_KEY_FILE:-}${SOPS_AGE_KEY_CMD:-}" ] && return 0
+  [ -f "$HOME/.ssh/id_ed25519" ] || [ -f "$HOME/.ssh/id_rsa" ] && return 0
+  [ -f "$HOME/Library/Application Support/sops/age/keys.txt" ] && return 0
+  [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -447,6 +475,10 @@ cmd_init() {
     fi
   fi
 
+  if ! has_identity; then
+    warn "no decryption identity found — sops probes only ~/.ssh/id_ed25519 and ~/.ssh/id_rsa; if your key lives elsewhere: git config glassine.identity <path> (or export SOPS_AGE_SSH_PRIVATE_KEY_FILE)"
+  fi
+
   # Refresh worktree copies that are still ciphertext (e.g. right after
   # cloning, before the filter existed). Note: checkout-index bypasses smudge
   # filters, so delete + checkout is the reliable re-smudge idiom.
@@ -625,6 +657,12 @@ COMMANDS
   uninstall      remove the filter configuration from this repository
   version        print version
 
+CONFIG
+  git config glassine.identity <path>
+                 SSH private key for decryption when it lives outside sops'
+                 default probe paths (~/.ssh/id_ed25519, ~/.ssh/id_rsa).
+                 An explicit SOPS_AGE_SSH_PRIVATE_KEY_FILE wins.
+
 INTERNAL (invoked by git)
   clean / smudge / textconv / merge
 
@@ -638,6 +676,7 @@ EOF
 main() {
   local cmd=${1:-help}
   shift || true
+  maybe_export_identity
   case "$cmd" in
   clean) cmd_clean "$@" ;;
   smudge) cmd_smudge "$@" ;;
