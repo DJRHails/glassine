@@ -673,4 +673,36 @@ ok 'glassine.identity expands a literal ~ against HOME'
 )
 ok 'unresolvable glassine.identity warns verbatim and degrades gracefully'
 
+# --- 34: ~/.ssh scan — recipient-matched keys at any name decrypt and get pinned ---
+# No glassine.identity config, no default-named keys: decrypt_to must scan
+# ~/.ssh, match public halves against the envelope's recipients, decrypt with
+# the winner, and pin it in git config for the fast path.
+
+HOME4="$WORK/home4"
+mkdir -p "$HOME4/.ssh"
+ssh-keygen -t ed25519 -N '' -C 'dh@oddname' -f "$HOME4/.ssh/id_github" -q
+ssh-keygen -t ed25519 -N '' -C 'dh@decoy' -f "$HOME4/.ssh/id_decoy" -q # never a recipient
+(
+  r="$WORK/scanrepo"
+  mkdir -p "$r" && cd "$r"
+  git_q init
+  git config user.name test && git config user.email test@example.invalid
+  HOME=$HOME4 glassine init >/dev/null 2>&1
+  HOME=$HOME4 glassine protect 'secrets/**' >/dev/null 2>&1
+  HOME=$HOME4 glassine allow "$HOME4/.ssh/id_github.pub" >/dev/null 2>&1
+  mkdir secrets && echo 'k1: scanme' >secrets/s.yaml
+  HOME=$HOME4 git add . && HOME=$HOME4 git commit -qm base # encryption needs only public keys
+  rm secrets/s.yaml
+  git cat-file blob :secrets/s.yaml >secrets/s.yaml # ciphertext worktree, as after a clone
+  # The commit's own re-clean already pinned the key via the scan; unset so
+  # this exercises init's decrypt-and-pin from scratch.
+  git config --unset glassine.identity
+  HOME=$HOME4 glassine init >/dev/null 2>&1
+  grep -q 'k1: scanme' secrets/s.yaml ||
+    fail 'scan did not find the recipient-matched key in ~/.ssh'
+  [ "$(git config glassine.identity)" = "$HOME4/.ssh/id_github" ] ||
+    fail 'winning key was not pinned as glassine.identity'
+)
+ok 'ssh-key scan decrypts via recipient match and pins glassine.identity'
+
 printf '\nall %d tests passed\n' "$PASS"

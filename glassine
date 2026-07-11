@@ -10,7 +10,7 @@
 # https://github.com/DJRHails/glassine
 set -euo pipefail
 
-readonly VERSION='0.5.1'
+readonly VERSION='0.6.0'
 
 GLASSINE_TMPDIR=''
 
@@ -76,8 +76,34 @@ is_binary() { # <file>
 # Decrypt src into dst, presenting the repo-relative path to sops so that
 # input-type detection and .sops.yaml creation rules behave as if the file
 # were at its real location.
+#
+# sops itself only probes ~/.ssh/id_ed25519 and ~/.ssh/id_rsa, so per-service
+# key names (id_github, id_work, …) would otherwise behave keyless. When the
+# default identities fail, scan ~/.ssh for key pairs whose public half is
+# among the envelope's own recipients — the metadata is plaintext, so the
+# match costs a grep and only matching keys are ever tried. The first key
+# that decrypts is pinned as `git config glassine.identity`, which
+# maybe_export_identity turns into the fast path for every later call.
 decrypt_to() { # <src> <dst> <repo-relative-path>
-  sops decrypt --filename-override "$3" "$1" >"$2" 2>/dev/null
+  if sops decrypt --filename-override "$3" "$1" >"$2" 2>/dev/null; then
+    return 0
+  fi
+  local pub key material
+  for pub in "$HOME"/.ssh/*.pub; do
+    key=${pub%.pub}
+    [ -f "$pub" ] && [ -f "$key" ] || continue
+    material=$(cut -d' ' -f2 "$pub" 2>/dev/null || true)
+    [ -n "$material" ] || continue
+    LC_ALL=C grep -aqF "$material" "$1" || continue # not a recipient of this envelope
+    if SOPS_AGE_SSH_PRIVATE_KEY_FILE=$key sops decrypt --filename-override "$3" "$1" >"$2" 2>/dev/null </dev/null; then
+      if [ -z "$(git config glassine.identity 2>/dev/null || true)" ] &&
+        git config glassine.identity "$key" 2>/dev/null; then
+        warn "decrypted with $key — pinned via git config glassine.identity"
+      fi
+      return 0
+    fi
+  done
+  return 1
 }
 
 # sops only probes ~/.ssh/id_ed25519 and ~/.ssh/id_rsa for SSH identities, so
@@ -96,16 +122,24 @@ maybe_export_identity() {
   export SOPS_AGE_SSH_PRIVATE_KEY_FILE=$id
 }
 
-# True when some decryption identity is plausibly available to sops: an
-# explicit env var (maybe_export_identity has already turned glassine.identity
-# into one — main runs it before dispatching any command), a default SSH key,
-# or an age keys.txt in either the macOS or XDG location.
+# True when some decryption identity is plausibly available: an explicit env
+# var (maybe_export_identity has already turned glassine.identity into one —
+# main runs it before dispatching any command), a default SSH key, an age
+# keys.txt in either the macOS or XDG location, or any SSH key pair in ~/.ssh
+# (decrypt_to scans those against each envelope's recipients).
 has_identity() {
   [ -n "${SOPS_AGE_SSH_PRIVATE_KEY_FILE:-}" ] && return 0
   [ -n "${SOPS_AGE_KEY:-}${SOPS_AGE_KEY_FILE:-}${SOPS_AGE_KEY_CMD:-}" ] && return 0
   [ -f "$HOME/.ssh/id_ed25519" ] || [ -f "$HOME/.ssh/id_rsa" ] && return 0
   [ -f "$HOME/Library/Application Support/sops/age/keys.txt" ] && return 0
-  [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt" ]
+  [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt" ] && return 0
+  local pub
+  for pub in "$HOME"/.ssh/*.pub; do
+    if [ -f "$pub" ] && [ -f "${pub%.pub}" ]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -466,7 +500,7 @@ cmd_init() {
   fi
 
   if ! has_identity; then
-    warn "no decryption identity found — sops probes only ~/.ssh/id_ed25519 and ~/.ssh/id_rsa; if your key lives elsewhere: git config glassine.identity <path> (or export SOPS_AGE_SSH_PRIVATE_KEY_FILE)"
+    warn 'no decryption identity found — no SSH key pairs in ~/.ssh, no glassine.identity config, no sops env vars; envelopes will pass through as ciphertext'
   fi
 
   # Refresh worktree copies that are still ciphertext (e.g. right after
@@ -643,8 +677,10 @@ COMMANDS
 
 CONFIG
   git config glassine.identity <path>
-                 SSH private key for decryption when it lives outside sops'
-                 default probe paths (~/.ssh/id_ed25519, ~/.ssh/id_rsa).
+                 SSH private key used for decryption. Normally set for you:
+                 when sops' default probe paths (~/.ssh/id_ed25519,
+                 ~/.ssh/id_rsa) fail, glassine scans ~/.ssh for the key pair
+                 matching the envelope's recipients and pins the winner here.
                  An explicit SOPS_AGE_SSH_PRIVATE_KEY_FILE wins.
 
 INTERNAL (invoked by git)
