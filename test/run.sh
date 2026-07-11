@@ -618,4 +618,24 @@ mkdir -p "$WORK/nokeys"
 )
 ok 'keyless allow/rotate fails loudly instead of claiming re-encryption'
 
+# --- 31: git config glassine.identity — key file at a non-default path ------------
+# sops only probes ~/.ssh/id_ed25519 and ~/.ssh/id_rsa; a per-service key name
+# (~/.ssh/id_github) decrypts nothing. The glassine.identity config names the
+# key per repo+machine and glassine exports it for every sops call.
+
+IDCLONE="$WORK/clone-identity"
+git_q clone "$ORIGIN" "$IDCLONE"
+(
+  cd "$IDCLONE"
+  git config user.name test && git config user.email test@example.invalid
+  git config glassine.identity "$WORK/keys/hosta" # deliberately non-default path
+  HOME="$WORK/nokeys" glassine init >/dev/null 2>&1
+  grep -q 'ghp_demo123' secrets/creds.yaml ||
+    fail 'glassine.identity did not decrypt the worktree on init'
+  touch secrets/creds.yaml
+  [ -z "$(HOME="$WORK/nokeys" git status --porcelain)" ] ||
+    fail 'clean memoisation did not pick up glassine.identity'
+)
+ok 'git config glassine.identity decrypts keys at non-default paths'
+
 printf '\nall %d tests passed\n' "$PASS"
