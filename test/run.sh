@@ -705,4 +705,125 @@ ssh-keygen -t ed25519 -N '' -C 'dh@decoy' -f "$HOME4/.ssh/id_decoy" -q # never a
 )
 ok 'ssh-key scan decrypts via recipient match and pins glassine.identity'
 
+# --- 35: allow --path — folder-scoped recipients -----------------------------
+# The scoped rule is seeded with the repo-wide recipients (grants only widen
+# access), sits before the catch-all (sops takes the first match), and only
+# its own files rotate.
+
+ssh-keygen -t ed25519 -N '' -C 'dh@guest' -f "$WORK/keys/guest" -q
+(
+  cd "$(mk_managed pathallow)"
+  g3 glassine protect 'config/**' >/dev/null 2>&1
+  mkdir config && echo 'c: 1' >config/c.yaml
+  g3 git add . && g3 git commit -qm config
+  SECRETS_BLOB=$(git rev-parse :secrets/s.yaml)
+
+  g3 glassine allow --path 'config/**' "$WORK/keys/guest.pub" >/dev/null 2>&1 ||
+    fail 'allow --path failed'
+  grep -qF '# glob: config/**' .sops.yaml ||
+    fail 'scoped rule does not record its glob'
+  awk '/^  - path_regex:/{p=NR} /^  - key_groups:/{c=NR} END{exit !(p && c && p<c)}' .sops.yaml ||
+    fail 'scoped rule is not ordered before the catch-all'
+
+  git cat-file blob :config/c.yaml >"$WORK/pp.enc"
+  as_host guest sops decrypt --filename-override config/c.yaml "$WORK/pp.enc" >/dev/null 2>&1 ||
+    fail 'guest cannot decrypt inside the granted path'
+  git cat-file blob :secrets/s.yaml >"$WORK/pp2.enc"
+  if as_host guest sops decrypt --filename-override secrets/s.yaml "$WORK/pp2.enc" >/dev/null 2>&1; then
+    fail 'guest can decrypt outside the granted path'
+  fi
+  SOPS_AGE_SSH_PRIVATE_KEY_FILE="$HOME3/.ssh/id_ed25519" \
+    sops decrypt --filename-override config/c.yaml "$WORK/pp.enc" >/dev/null 2>&1 ||
+    fail 'repo-wide recipient lost access to the scoped path'
+  [ "$(git rev-parse :secrets/s.yaml)" = "$SECRETS_BLOB" ] ||
+    fail 'scoped allow rotated files outside its path'
+  g3 glassine check >/dev/null 2>&1 || fail 'check reports drift after allow --path'
+  g3 git add -A && g3 git commit -qm 'grant config to guest'
+)
+ok 'allow --path scopes a recipient to a folder and rotates only it'
+
+# --- 36: global allow propagates into scoped rules ----------------------------
+
+ssh-keygen -t ed25519 -N '' -C 'dh@fleet' -f "$WORK/keys/fleet" -q
+(
+  cd "$WORK/pathallow"
+  g3 glassine allow "$WORK/keys/fleet.pub" >/dev/null 2>&1 || fail 'global allow failed'
+  [ "$(grep -cF "$(cut -d' ' -f2 "$WORK/keys/fleet.pub")" .sops.yaml)" = '2' ] ||
+    fail 'global allow did not propagate into the scoped rule'
+  for f in config/c.yaml secrets/s.yaml; do
+    git cat-file blob ":$f" >"$WORK/fleet.enc"
+    as_host fleet sops decrypt --filename-override "$f" "$WORK/fleet.enc" >/dev/null 2>&1 ||
+      fail "fleet key cannot decrypt $f after global allow"
+  done
+  g3 glassine check >/dev/null 2>&1 || fail 'drift after a propagating allow'
+  g3 git add -A && g3 git commit -qm 'allow fleet'
+)
+ok 'global allow lands in the catch-all and every scoped rule'
+
+# --- 37: per-path recipient drift — check flags it, rotate heals ----------------
+# Mimic a merge that changed policy without rotating: hand-add a recipient to
+# the scoped rule only, so its envelopes no longer match their own rule.
+
+ssh-keygen -t ed25519 -N '' -C 'dh@drift' -f "$WORK/keys/drift" -q
+(
+  cd "$WORK/pathallow"
+  awk -v key="          - '$(cut -d' ' -f1-2 "$WORK/keys/drift.pub")' # drift" '
+    /# glob: config\/\*\*/ { inrule = 1 }
+    { print }
+    inrule && !done && /- age:[[:space:]]*$/ { print key; done = 1 }
+  ' .sops.yaml >"$WORK/drift.yaml" && cat "$WORK/drift.yaml" >.sops.yaml
+  if g3 glassine check >/dev/null 2>&1; then
+    fail 'check missed per-path recipient drift'
+  fi
+  g3 glassine rotate >/dev/null 2>&1 || fail 'rotate failed on per-path drift'
+  g3 glassine check >/dev/null 2>&1 || fail 'check still failing after rotate'
+  git cat-file blob :config/c.yaml >"$WORK/drift.enc"
+  as_host drift sops decrypt --filename-override config/c.yaml "$WORK/drift.enc" >/dev/null 2>&1 ||
+    fail 'hand-added recipient cannot decrypt after the heal'
+  g3 git add -A && g3 git commit -qm 'heal path drift'
+)
+ok 'per-path drift: check flags it, rotate heals under the right rule'
+
+# --- 38: revoke --path removes scoped access; rules never empty ------------------
+
+(
+  cd "$WORK/pathallow"
+  g3 glassine revoke --path 'config/**' guest >/dev/null 2>&1 || fail 'revoke --path failed'
+  grep -qF "$(cut -d' ' -f2 "$WORK/keys/guest.pub")" .sops.yaml &&
+    fail 'revoke --path left the guest in .sops.yaml'
+  git cat-file blob :config/c.yaml >"$WORK/rvk.enc"
+  if as_host guest sops decrypt --filename-override config/c.yaml "$WORK/rvk.enc" >/dev/null 2>&1; then
+    fail 'revoked guest still decrypts the scoped path'
+  fi
+  g3 glassine check >/dev/null 2>&1 || fail 'drift after revoke --path'
+  if g3 glassine revoke 'ssh-ed25519' >/dev/null 2>&1; then
+    fail 'revoke emptied a rule'
+  fi
+  g3 git add -A && g3 git commit -qm 'revoke guest from config'
+)
+ok 'revoke --path removes scoped access; rules never empty'
+
+# --- 39: allow --path warns when the glob matches no managed files ----------------
+
+ssh-keygen -t ed25519 -N '' -C 'dh@lost' -f "$WORK/keys/lost" -q
+(
+  cd "$WORK/pathallow"
+  g3 glassine allow --path 'nowhere/**' "$WORK/keys/lost.pub" >/dev/null 2>"$WORK/lost.err" ||
+    fail 'allow --path on an unprotected glob must still succeed'
+  grep -q 'matches no glassine-managed files' "$WORK/lost.err" ||
+    fail 'no warning for a glob that matches nothing'
+)
+ok 'allow --path warns when the glob matches no managed files'
+
+# --- 40: duplicate allow --path skips rotation -------------------------------------
+
+(
+  cd "$WORK/pathallow"
+  BLOB=$(git rev-parse :config/c.yaml)
+  g3 glassine allow --path 'config/**' "$WORK/keys/fleet.pub" >/dev/null 2>&1 || true
+  [ "$(git rev-parse :config/c.yaml)" = "$BLOB" ] ||
+    fail 'duplicate scoped allow still rotated'
+)
+ok 'duplicate allow --path skips rotation'
+
 printf '\nall %d tests passed\n' "$PASS"
