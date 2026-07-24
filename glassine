@@ -10,7 +10,7 @@
 # https://github.com/DJRHails/glassine
 set -euo pipefail
 
-readonly VERSION='0.6.0'
+readonly VERSION='0.7.0'
 
 GLASSINE_TMPDIR=''
 
@@ -277,9 +277,14 @@ managed_files() {
 # ---------------------------------------------------------------------------
 # recipient management (.sops.yaml)
 #
-# glassine generates a single catch-all creation rule: WHICH files are
-# protected is decided solely by .gitattributes (glassine protect), so
-# .sops.yaml only answers WHO may read. Auto-editing is gated on the
+# WHICH files are protected is decided solely by .gitattributes (glassine
+# protect); .sops.yaml answers WHO may read them. The managed layout holds
+# scoped rules first (one per `allow --path` glob, identified by the
+# `# glob:` comment on its path_regex line) and the repo-wide catch-all
+# last — sops takes the first matching rule, so a scoped rule's recipient
+# set is exactly who can read its files. Scoped rules are seeded with the
+# catch-all's recipients and every global allow propagates into them, so
+# scoped grants only ever widen access. Auto-editing is gated on the
 # "managed by glassine" marker — hand-written files are never rewritten.
 # ---------------------------------------------------------------------------
 
@@ -287,9 +292,120 @@ sops_yaml_managed() { # <file>
   head -1 "$1" 2>/dev/null | grep -q 'managed by glassine'
 }
 
-# Key tokens from a managed .sops.yaml (keys only appear on recipient lines).
-policy_keys() { # <file>
-  LC_ALL=C grep -aoE 'ssh-(ed25519|rsa) [A-Za-z0-9+/=]+|age1[0-9a-z]+' "$1" | sort -u || true
+# Translate a protect-style glob into the anchored regex sops matches against
+# the path (relative to .sops.yaml — glassine always runs sops at the repo
+# root): ** crosses directories, * and ? stay within one component.
+glob_to_regex() { # <glob>
+  local g=$1 out='' i c
+  for ((i = 0; i < ${#g}; i++)); do
+    c=${g:i:1}
+    case "$c" in
+    '*')
+      if [ "${g:i+1:1}" = '*' ]; then
+        out="${out}.*"
+        i=$((i + 1))
+      else
+        out="${out}[^/]*"
+      fi
+      ;;
+    '?') out="${out}[^/]" ;;
+    '.' | '+' | '^' | '$' | '(' | ')' | '{' | '}' | '|' | '[' | ']')
+      out="${out}\\$c"
+      ;;
+    [\\]) out="${out}\\\\" ;;
+    *) out="${out}$c" ;;
+    esac
+  done
+  printf '^%s$' "$out"
+}
+
+# Managed-policy parser: one "rule<TAB><regex>" line per rule (catch-all has
+# an empty regex) followed by one "key<TAB><key>" line per recipient.
+policy_rules() { # <file>
+  awk -v q="'" '
+    $0 ~ ("^  - path_regex:[[:space:]]*" q) {
+      re = $0
+      sub("^  - path_regex:[[:space:]]*" q, "", re)
+      sub(q ".*$", "", re)
+      print "rule\t" re
+      next
+    }
+    /^  - key_groups:/ { print "rule\t"; next }
+    $0 ~ ("^[[:space:]]+- " q "(ssh-(ed25519|rsa) |age1)") {
+      k = $0
+      sub("^[[:space:]]+- " q, "", k)
+      sub(q ".*$", "", k)
+      print "key\t" k
+    }
+  ' "$1"
+}
+
+# Load the managed policy into parallel arrays for per-path lookups:
+# RULE_REGEXES[i] ('' = catch-all) and RULE_KEYS[i] (newline-joined, sorted
+# like envelope_keys so the two compare directly).
+RULE_REGEXES=()
+RULE_KEYS=()
+load_policy_rules() { # <file>
+  RULE_REGEXES=()
+  RULE_KEYS=()
+  local tag rest i=-1
+  while IFS=$'\t' read -r tag rest; do
+    if [ "$tag" = 'rule' ]; then
+      i=$((i + 1))
+      RULE_REGEXES[i]=$rest
+      RULE_KEYS[i]=''
+    elif [ "$tag" = 'key' ] && [ "$i" -ge 0 ]; then
+      RULE_KEYS[i]="${RULE_KEYS[i]}${RULE_KEYS[i]:+$'\n'}$rest"
+    fi
+  done < <(policy_rules "$1")
+  [ "$i" -ge 0 ] || return 0
+  for i in "${!RULE_KEYS[@]}"; do
+    if [ -n "${RULE_KEYS[i]}" ]; then
+      RULE_KEYS[i]=$(printf '%s\n' "${RULE_KEYS[i]}" | sort -u)
+    fi
+  done
+}
+
+# The recipient set a path's envelope must be wrapped to: first matching rule
+# wins, replicating sops' own selection. Empty when no rule matches.
+expected_keys() { # <path>
+  [ ${#RULE_REGEXES[@]} -gt 0 ] || return 0
+  local i
+  for i in "${!RULE_REGEXES[@]}"; do
+    if [ -z "${RULE_REGEXES[i]}" ] || [[ $1 =~ ${RULE_REGEXES[i]} ]]; then
+      printf '%s' "${RULE_KEYS[i]}"
+      return 0
+    fi
+  done
+}
+
+# Globs of the scoped rules, in rule order.
+list_rule_globs() { # <file>
+  awk '/^  - path_regex:/ && match($0, /# glob: /) { print substr($0, RSTART + 8) }' "$1"
+}
+
+# Recipient lines of the catch-all rule, verbatim (indentation and comments).
+catchall_key_lines() { # <file>
+  awk -v q="'" '
+    /^  - path_regex:/ { incatch = 0 }
+    /^  - key_groups:/ { incatch = 1; next }
+    incatch && $0 ~ ("^[[:space:]]+- " q "(ssh-(ed25519|rsa) |age1)") { print }
+  ' "$1"
+}
+
+# True when <glob>'s rule (the catch-all for '') already lists <key>.
+rule_has_key() { # <file> <glob> <key>
+  awk -v q="'" -v glob="$2" -v key="$3" '
+    /^  - path_regex:/ {
+      cur = ""
+      if (match($0, /# glob: /)) cur = substr($0, RSTART + 8)
+      target = (cur == glob)
+      next
+    }
+    /^  - key_groups:/ { target = (glob == ""); next }
+    target && index($0, q key q) { found = 1; exit }
+    END { exit !found }
+  ' "$1"
 }
 
 # Key tokens an envelope is actually wrapped to. Restricted to lines that
@@ -308,20 +424,54 @@ creation_rules:
 EOF
 }
 
-# Append one recipient under the first `- age:` list. Returns 1 on duplicate.
-add_recipient() { # <file> <key> <comment>
-  local file=$1 key=$2 comment=$3 tmp
-  if grep -qF "$key" "$file"; then
-    warn "already a recipient: ${comment:-$key}"
+# Append one recipient under <glob>'s rule (the catch-all for ''). Returns 1
+# on duplicate within that rule.
+add_recipient() { # <file> <key> <comment> <glob>
+  local file=$1 key=$2 comment=$3 glob=$4 tmp
+  if rule_has_key "$file" "$glob" "$key"; then
+    warn "already a recipient${glob:+ of $glob}: ${comment:-$key}"
     return 1
   fi
   ensure_tmpdir
   tmp="$GLASSINE_TMPDIR/sops_yaml"
-  awk -v line="          - '${key}'${comment:+ # ${comment}}" '
+  awk -v line="          - '${key}'${comment:+ # ${comment}}" -v glob="$glob" '
+    /^  - path_regex:/ {
+      cur = ""
+      if (match($0, /# glob: /)) cur = substr($0, RSTART + 8)
+      target = (cur == glob)
+    }
+    /^  - key_groups:/ { target = (glob == "") }
     { print }
-    !done && $0 ~ /- age:[[:space:]]*$/ { print line; done = 1 }
+    target && !done && $0 ~ /- age:[[:space:]]*$/ { print line; done = 1 }
   ' "$file" >"$tmp"
   cat "$tmp" >"$file"
+}
+
+# Ensure a scoped rule for <glob> exists, seeded with the catch-all's
+# recipients so a scoped grant only ever widens access. New rules land after
+# existing scoped rules and before the catch-all: sops takes the first
+# matching rule, so on overlap the oldest rule wins.
+ensure_path_rule() { # <file> <glob>
+  local file=$1 glob=$2
+  grep -qF "# glob: ${glob}" "$file" && return 0
+  ensure_tmpdir
+  local tmp="$GLASSINE_TMPDIR/sops_yaml" block="$GLASSINE_TMPDIR/rule_block"
+  {
+    printf "  - path_regex: '%s' # glob: %s\n" "$(glob_to_regex "$glob")" "$glob"
+    printf '    key_groups:\n'
+    printf '      - age:\n'
+    catchall_key_lines "$file"
+  } >"$block"
+  awk -v blockfile="$block" '
+    !inserted && /^  - key_groups:/ {
+      while ((getline l < blockfile) > 0) print l
+      close(blockfile)
+      inserted = 1
+    }
+    { print }
+  ' "$file" >"$tmp"
+  cat "$tmp" >"$file"
+  printf 'glassine: new scoped rule for %s (seeded with the repo-wide recipients)\n' "$glob"
 }
 
 # Resolve one allow argument into "key<TAB>comment" lines on stdout.
@@ -369,8 +519,37 @@ rotate_if_managed() {
   done < <(managed_files)
 }
 
-cmd_allow() { # <key | path/to/key.pub | github:user>...
-  [ $# -gt 0 ] || die 'usage: glassine allow <ssh-pubkey | key-file.pub | github:user>...'
+# Re-encrypt only the managed files a scoped rule covers. Warns (and skips)
+# when the glob covers nothing — the classic sign of a typo or a path that
+# was never `glassine protect`ed.
+rotate_glob() { # <glob>
+  local glob=$1 regex f files=()
+  regex=$(glob_to_regex "$glob")
+  while IFS= read -r -d '' f; do
+    if [[ $f =~ $regex ]]; then
+      files+=("$f")
+    fi
+  done < <(managed_files)
+  if [ ${#files[@]} -eq 0 ]; then
+    warn "$glob matches no glassine-managed files — is it protected in .gitattributes?"
+    return 0
+  fi
+  cmd_rotate "${files[@]}"
+}
+
+cmd_allow() { # [--path <glob>] <key | path/to/key.pub | github:user>...
+  local path_glob=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --path)
+      [ $# -ge 2 ] || die 'allow: --path requires a glob argument'
+      path_glob=$2
+      shift 2
+      ;;
+    *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || die 'usage: glassine allow [--path <glob>] <ssh-pubkey | key-file.pub | github:user>...'
   local root
   root=$(git rev-parse --show-toplevel 2>/dev/null) || die 'not inside a git repository'
   need_sops
@@ -385,48 +564,105 @@ cmd_allow() { # <key | path/to/key.pub | github:user>...
 
   local sops_yaml="$root/.sops.yaml"
   if [ ! -f "$sops_yaml" ]; then
+    [ -z "$path_glob" ] ||
+      die "no .sops.yaml yet — run 'glassine init' (or a plain 'glassine allow') before scoping recipients"
     create_sops_yaml "$sops_yaml"
   elif ! sops_yaml_managed "$sops_yaml"; then
     die '.sops.yaml is not managed by glassine — add recipients there manually'
   fi
 
-  local key comment added=0
+  [ -z "$path_glob" ] || ensure_path_rule "$sops_yaml" "$path_glob"
+
+  local key comment glob added=0
   while IFS=$'\t' read -r key comment; do
-    if add_recipient "$sops_yaml" "$key" "$comment"; then
-      printf 'glassine: allowed %s\n' "${comment:-$key}"
-      added=$((added + 1))
+    if [ -n "$path_glob" ]; then
+      if add_recipient "$sops_yaml" "$key" "$comment" "$path_glob"; then
+        printf 'glassine: allowed %s for %s\n' "${comment:-$key}" "$path_glob"
+        added=$((added + 1))
+      fi
+    else
+      if add_recipient "$sops_yaml" "$key" "$comment" ''; then
+        printf 'glassine: allowed %s\n' "${comment:-$key}"
+        added=$((added + 1))
+        # Scoped rules stay a superset of the repo-wide set: a global grant
+        # reaches every scoped rule too (duplicates are silently fine).
+        while IFS= read -r glob; do
+          add_recipient "$sops_yaml" "$key" "$comment" "$glob" 2>/dev/null || true
+        done < <(list_rule_globs "$sops_yaml")
+      fi
     fi
   done <"$recips"
 
   if [ "$added" -gt 0 ]; then
-    rotate_if_managed
+    if [ -n "$path_glob" ]; then
+      rotate_glob "$path_glob"
+    else
+      rotate_if_managed
+    fi
   fi
 }
 
-cmd_revoke() { # <pattern>
-  [ $# -eq 1 ] || die 'usage: glassine revoke <pattern matching a recipient line>'
+cmd_revoke() { # [--path <glob>] <pattern>
+  local path_glob=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --path)
+      [ $# -ge 2 ] || die 'revoke: --path requires a glob argument'
+      path_glob=$2
+      shift 2
+      ;;
+    *) break ;;
+    esac
+  done
+  [ $# -eq 1 ] || die 'usage: glassine revoke [--path <glob>] <pattern matching a recipient line>'
   local pattern=$1 root
   root=$(git rev-parse --show-toplevel 2>/dev/null) || die 'not inside a git repository'
   need_sops
   local sops_yaml="$root/.sops.yaml"
   [ -f "$sops_yaml" ] || die 'no .sops.yaml in this repository'
   sops_yaml_managed "$sops_yaml" || die '.sops.yaml is not managed by glassine — remove recipients there manually'
+  if [ -n "$path_glob" ] && ! grep -qF "# glob: ${path_glob}" "$sops_yaml"; then
+    die "no scoped rule for: $path_glob"
+  fi
 
   ensure_tmpdir
-  local tmp="$GLASSINE_TMPDIR/sops_yaml" removed remaining
-  # Recipient lines look like:       - 'ssh-ed25519 AAAA...' # comment
-  removed=$(grep -cE "^[[:space:]]+- '.*${pattern}" "$sops_yaml" || true)
-  [ "$removed" -gt 0 ] || die "no recipient matches: $pattern"
-  awk -v pat="$pattern" '
-    $0 ~ /^[[:space:]]+- '\''/ && $0 ~ pat { next }
+  local tmp="$GLASSINE_TMPDIR/sops_yaml" counts="$GLASSINE_TMPDIR/revoke_count" rc=0
+  # Delete matching recipient lines in the targeted rule(s), but never leave
+  # any rule without recipients — sops would refuse to encrypt its files.
+  awk -v q="'" -v pat="$pattern" -v glob="$path_glob" -v cf="$counts" '
+    /^  - path_regex:/ {
+      cur = ""
+      if (match($0, /# glob: /)) cur = substr($0, RSTART + 8)
+      rule++
+      target = (glob == "" || cur == glob)
+    }
+    /^  - key_groups:/ { rule++; target = (glob == "") }
+    $0 ~ ("^[[:space:]]+- " q "(ssh-(ed25519|rsa) |age1)") {
+      if (target && $0 ~ pat) { removed++; next }
+      kept[rule]++
+    }
     { print }
-  ' "$sops_yaml" >"$tmp"
-  remaining=$(grep -cE "^[[:space:]]+- '" "$tmp" || true)
-  [ "$remaining" -gt 0 ] || die "refusing to remove the last recipient ($pattern matches all of them)"
+    END {
+      printf "%d\n", removed > cf
+      if (removed == 0) exit 2
+      for (r = 1; r <= rule; r++) if (!kept[r]) exit 3
+    }
+  ' "$sops_yaml" >"$tmp" || rc=$?
+  case "$rc" in
+  0) ;;
+  2) die "no recipient matches${path_glob:+ in $path_glob}: $pattern" ;;
+  3) die "refusing to leave a rule with no recipients ($pattern matches too much)" ;;
+  *) die "revoke failed (awk exit $rc)" ;;
+  esac
   cat "$tmp" >"$sops_yaml"
-  printf 'glassine: revoked %d recipient(s) matching %s\n' "$removed" "$pattern"
+  printf 'glassine: revoked %d recipient(s) matching %s%s\n' \
+    "$(cat "$counts")" "$pattern" "${path_glob:+ from $path_glob}"
 
-  rotate_if_managed
+  if [ -n "$path_glob" ]; then
+    rotate_glob "$path_glob"
+  else
+    rotate_if_managed
+  fi
   warn 'revocation is forward-only: the revoked key keeps history it could already read — rotate the secret values too if this was a compromise'
 }
 
@@ -492,7 +728,7 @@ cmd_init() {
     if [ -n "$pub" ]; then
       create_sops_yaml "$root/.sops.yaml"
       read -r t b _rest <"$pub"
-      add_recipient "$root/.sops.yaml" "$t $b" "${_rest:-$(hostname)}" || true
+      add_recipient "$root/.sops.yaml" "$t $b" "${_rest:-$(hostname)}" '' || true
       printf "glassine: created .sops.yaml with this host's key (%s)\n" "$pub"
       printf 'glassine: add more recipients with: glassine allow <key | key.pub | github:user>\n'
     else
@@ -556,9 +792,10 @@ cmd_rotate() { # [paths...]
 
   GLASSINE_FORCE=1 git add --renormalize -- "${files[@]}"
 
-  local policy=''
+  local policy='' policy_loaded=0
   if [ -f "$root/.sops.yaml" ] && sops_yaml_managed "$root/.sops.yaml"; then
-    policy=$(policy_keys "$root/.sops.yaml")
+    policy_loaded=1
+    load_policy_rules "$root/.sops.yaml"
   fi
 
   ensure_tmpdir
@@ -579,6 +816,8 @@ cmd_rotate() { # [paths...]
     fi
     git cat-file blob "$new" >"$blob" 2>/dev/null || continue
     [ -s "$blob" ] || continue # empty files pass through unencrypted by design
+    policy=''
+    [ "$policy_loaded" = 0 ] || policy=$(expected_keys "$f")
     if [ -n "$policy" ] && [ "$(envelope_keys "$blob")" != "$policy" ]; then
       drifted="$drifted $f"
     else
@@ -605,15 +844,18 @@ cmd_check() {
   local root
   root=$(git rev-parse --show-toplevel 2>/dev/null) || die 'not inside a git repository'
   ensure_tmpdir
-  local f bad=0 drift=0 blob="$GLASSINE_TMPDIR/blob" policy=''
+  local f bad=0 drift=0 blob="$GLASSINE_TMPDIR/blob" policy='' policy_loaded=0
   if [ -f "$root/.sops.yaml" ] && sops_yaml_managed "$root/.sops.yaml"; then
-    policy=$(policy_keys "$root/.sops.yaml")
+    policy_loaded=1
+    load_policy_rules "$root/.sops.yaml"
   fi
   while IFS= read -r -d '' f; do
     # Empty blobs pass through unencrypted by design — nothing to protect.
     if ! git cat-file blob ":$f" >"$blob" 2>/dev/null || [ ! -s "$blob" ]; then
       continue
     fi
+    policy=''
+    [ "$policy_loaded" = 0 ] || policy=$(expected_keys "$f")
     if ! is_envelope "$blob"; then
       printf 'glassine: NOT ENCRYPTED in index: %s\n' "$f" >&2
       bad=1
@@ -663,10 +905,16 @@ COMMANDS
                  decrypts still-encrypted worktree files (e.g. after cloning)
   protect <g>…   protect globs: writes .gitattributes lines and encrypts any
                  already-tracked plaintext matches
-  allow <r>…     add recipients: a literal key, a .pub file, or github:user
-                 (fetches github.com/<user>.keys); re-encrypts managed files
-  revoke <pat>   remove recipients matching <pat> and rotate data keys
-                 (forward-only: rotate secret values too on compromise)
+  allow [--path <glob>] <r>…
+                 add recipients: a literal key, a .pub file, or github:user
+                 (fetches github.com/<user>.keys); re-encrypts managed files.
+                 --path scopes them to files matching <glob>: the scoped rule
+                 is seeded with the repo-wide recipients, so it only ever
+                 widens access, and only its own files rotate
+  revoke [--path <glob>] <pat>
+                 remove recipients matching <pat> and rotate data keys
+                 (forward-only: rotate secret values too on compromise);
+                 --path removes them from that scoped rule only
   status         list managed files and their index state
   check          fail if any staged managed file is unencrypted (pre-commit);
                  also advises (non-fatally) on binary content under glassine

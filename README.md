@@ -63,6 +63,9 @@ glassine allow github:alice              # every SSH key on alice's GitHub accou
 glassine allow ~/.ssh/id_ed25519.pub     # a key file
 glassine allow 'ssh-ed25519 AAAA… ci'    # a literal key
 glassine revoke alice                    # forward-only; rotates data keys
+
+glassine allow --path 'infra/**' github:bob   # bob reads infra/** only
+glassine revoke --path 'infra/**' bob         # …and loses just that again
 ```
 
 `allow` and `revoke` edit `.sops.yaml` and immediately re-encrypt managed
@@ -76,11 +79,15 @@ rekey, nothing is orphaned. If you revoke because of compromise, rotate the
 secret *values* too.
 
 Scope (`.gitattributes`, via `protect`) decides **which** files are
-encrypted; `.sops.yaml` (via `allow`/`revoke`) decides **who** can read them.
-glassine generates a single catch-all creation rule, and only ever auto-edits
-a `.sops.yaml` carrying its `managed by glassine` marker — hand-written
-policies are left alone (you get path-scoped recipients back, at the cost of
-editing recipients manually).
+encrypted; `.sops.yaml` (via `allow`/`revoke`) decides **who** can read them
+— repo-wide by default, per path with `--path`. A scoped grant creates a
+creation rule for that glob ahead of the repo-wide catch-all (sops takes the
+first match), seeded with the catch-all's recipients so it only ever widens
+access; global `allow`s propagate into every scoped rule, and `check`/
+`rotate` verify each envelope against the rule that actually covers it. On
+overlapping globs the oldest rule wins. glassine only ever auto-edits a
+`.sops.yaml` carrying its `managed by glassine` marker — hand-written
+policies are left alone.
 
 ## Commands
 
@@ -88,8 +95,8 @@ editing recipients manually).
 |---|---|
 | `init` | configure filters + merge driver; bootstrap `.sops.yaml`; decrypt any still-encrypted worktree files |
 | `protect <glob>…` | protect paths: write `.gitattributes` lines, encrypt already-tracked matches |
-| `allow <recipient>…` | add recipients (literal key, `.pub` file, or `github:user`) and rotate |
-| `revoke <pattern>` | remove matching recipients and rotate (keeps ≥1 recipient) |
+| `allow [--path <glob>] <recipient>…` | add recipients (literal key, `.pub` file, or `github:user`) and rotate; `--path` scopes them to one glob |
+| `revoke [--path <glob>] <pattern>` | remove matching recipients and rotate (every rule keeps ≥1 recipient); `--path` scopes the removal |
 | `status` | list managed files and their index state |
 | `check` | fail if any staged managed file is unencrypted — use as a pre-commit hook |
 | `rotate [files…]` | force re-encryption with fresh data keys under current `.sops.yaml` |
