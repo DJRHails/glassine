@@ -11,7 +11,7 @@ export PATH="$ROOT:$PATH"
 # and from any ambient sops identity — an exported SOPS_AGE_SSH_PRIVATE_KEY_FILE
 # always beats glassine.identity, so a host with one breaks the keyless tests.
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
-unset SOPS_AGE_SSH_PRIVATE_KEY_FILE SOPS_AGE_KEY_FILE SOPS_AGE_KEY
+unset SOPS_AGE_SSH_PRIVATE_KEY_FILE SOPS_AGE_KEY_FILE SOPS_AGE_KEY SOPS_AGE_KEY_CMD
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/glassine-test.XXXXXX")
 trap 'rm -rf -- "${WORK:?}"' EXIT
