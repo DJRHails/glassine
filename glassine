@@ -744,15 +744,23 @@ cmd_init() {
   # cloning, before the filter existed). Note: checkout-index bypasses smudge
   # filters, so delete + checkout is the reliable re-smudge idiom.
   ensure_tmpdir
-  local f refreshed=0
+  local f refreshed=0 still_ciphertext=0
   while IFS= read -r -d '' f; do
     if [ -f "$root/$f" ] && is_envelope "$root/$f"; then
       rm -f -- "$root/$f"
       git checkout -- "$f"
-      refreshed=$((refreshed + 1))
+      # smudge never fails — a host without a matching identity gets the
+      # envelope back verbatim, so only a real plaintext counts as decrypted.
+      if is_envelope "$root/$f"; then
+        still_ciphertext=$((still_ciphertext + 1))
+      else
+        refreshed=$((refreshed + 1))
+      fi
     fi
   done < <(managed_files)
   [ "$refreshed" -eq 0 ] || printf 'glassine: decrypted %d file(s) into the working tree\n' "$refreshed"
+  [ "$still_ciphertext" -eq 0 ] ||
+    warn "$still_ciphertext file(s) remain ciphertext — no available identity matches their recipients (grant one with: glassine allow <key.pub>)"
 
   printf 'glassine: filters configured for %s\n' "$root"
   printf "glassine: choose what to protect, e.g.: glassine protect 'secrets/**'\n"

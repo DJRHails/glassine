@@ -7,8 +7,11 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export PATH="$ROOT:$PATH"
 
-# Isolate from the developer's global git config (hooks, templates, signing).
+# Isolate from the developer's global git config (hooks, templates, signing)
+# and from any ambient sops identity — an exported SOPS_AGE_SSH_PRIVATE_KEY_FILE
+# always beats glassine.identity, so a host with one breaks the keyless tests.
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+unset SOPS_AGE_SSH_PRIVATE_KEY_FILE SOPS_AGE_KEY_FILE SOPS_AGE_KEY
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/glassine-test.XXXXXX")
 trap 'rm -rf -- "${WORK:?}"' EXIT
@@ -105,7 +108,12 @@ git_q clone "$ORIGIN" "$KEYLESS"
   git config user.name test && git config user.email test@example.invalid
   grep -q 'ENC\[AES256_GCM' secrets/creds.yaml ||
     fail 'keyless clone does not see ciphertext'
-  SOPS_AGE_SSH_PRIVATE_KEY_FILE="$WORK/keys/missing" glassine init >/dev/null 2>&1
+  init_out=$(SOPS_AGE_SSH_PRIVATE_KEY_FILE="$WORK/keys/missing" glassine init 2>&1)
+  case $init_out in
+  *decrypted*) fail 'keyless init claimed it decrypted files it could not open' ;;
+  esac
+  printf '%s\n' "$init_out" | grep -q 'remain ciphertext' ||
+    fail 'keyless init did not warn about undecryptable envelopes'
   touch secrets/creds.yaml
   [ -z "$(SOPS_AGE_SSH_PRIVATE_KEY_FILE=$WORK/keys/missing git status --porcelain)" ] ||
     fail 'envelope did not round-trip cleanly on a keyless host'
