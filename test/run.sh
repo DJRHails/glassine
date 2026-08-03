@@ -105,12 +105,19 @@ git_q clone "$ORIGIN" "$KEYLESS"
   git config user.name test && git config user.email test@example.invalid
   grep -q 'ENC\[AES256_GCM' secrets/creds.yaml ||
     fail 'keyless clone does not see ciphertext'
-  SOPS_AGE_SSH_PRIVATE_KEY_FILE="$WORK/keys/missing" glassine init >/dev/null 2>&1
+  INIT_OUT=$(SOPS_AGE_SSH_PRIVATE_KEY_FILE="$WORK/keys/missing" glassine init 2>&1)
+  case "$INIT_OUT" in
+  *'decrypted'*) fail 'keyless init claimed it decrypted files it could not' ;;
+  esac
+  case "$INIT_OUT" in
+  *'still ciphertext'*) : ;;
+  *) fail 'keyless init did not warn about still-ciphertext files' ;;
+  esac
   touch secrets/creds.yaml
   [ -z "$(SOPS_AGE_SSH_PRIVATE_KEY_FILE=$WORK/keys/missing git status --porcelain)" ] ||
     fail 'envelope did not round-trip cleanly on a keyless host'
 )
-ok 'keyless clone sees ciphertext and round-trips it unchanged'
+ok 'keyless clone sees ciphertext and round-trips it unchanged, warning not claiming decryption'
 
 # --- 5: keyed clone — init decrypts the worktree ------------------------------
 
