@@ -10,7 +10,7 @@
 # https://github.com/DJRHails/glassine
 set -euo pipefail
 
-readonly VERSION='0.7.0'
+readonly VERSION='0.7.1'
 
 GLASSINE_TMPDIR=''
 
@@ -263,9 +263,20 @@ cmd_merge() { # <base %O> <ours %A> <theirs %B> <marker-size %L> <path %P>
 # repository commands
 # ---------------------------------------------------------------------------
 
-# Tracked paths whose filter attribute is glassine, NUL-separated on stdout.
-managed_files() {
-  git ls-files -z |
+# Tracked paths whose filter attribute is glassine, NUL-separated on stdout,
+# optionally restricted to the given pathspecs.
+# Regular files only: git never runs filters on symlinks or submodules (their
+# blobs hold the target/commit raw), so glassine cannot manage them and every
+# command that judged them anyway raised false alarms (rotate: phantom drift,
+# check: NOT ENCRYPTED, status: PLAINTEXT).
+managed_files() { # [pathspec...]
+  local entry
+  git ls-files -sz -- "$@" |
+    while IFS= read -r -d '' entry; do
+      case "$entry" in
+      100*) printf '%s\0' "${entry#*$'\t'}" ;;
+      esac
+    done |
     git check-attr --stdin -z filter |
     while IFS= read -r -d '' p && IFS= read -r -d '' _ && IFS= read -r -d '' v; do
       if [ "$v" = 'glassine' ]; then
@@ -779,18 +790,22 @@ cmd_uninstall() {
 #
 # Re-minting needs the plaintext, so a worktree copy that is still ciphertext
 # only rotates where a local key can decrypt it. Files left behind are
-# reported, never silently skipped: recipient drift is fatal; an envelope that
-# already matches policy but keeps its old data key is a warning.
-cmd_rotate() { # [paths...]
+# reported, never silently skipped: recipient drift is fatal, a blob the
+# filter never encrypted at all (rotate before init) is fatal; an envelope
+# that already matches policy but keeps its old data key is a warning.
+cmd_rotate() { # [pathspec...]
   local root
   root=$(git rev-parse --show-toplevel 2>/dev/null) || die 'not inside a git repository'
+  # Explicit pathspecs go through managed_files too, so the symlink/submodule
+  # exemption and the filter=glassine boundary hold no matter how a file is
+  # named; anything else fails here with an exact reason instead of surfacing
+  # later as a bogus rotation report.
   local files=() f
-  if [ $# -gt 0 ]; then
-    files=("$@")
-  else
-    while IFS= read -r -d '' f; do files+=("$f"); done < <(managed_files)
+  while IFS= read -r -d '' f; do files+=("$f"); done < <(managed_files "$@")
+  if [ ${#files[@]} -eq 0 ]; then
+    [ $# -eq 0 ] || die "no glassine-managed regular files match: $*"
+    die 'no glassine-managed files found (set "filter=glassine" in .gitattributes)'
   fi
-  [ ${#files[@]} -gt 0 ] || die 'no glassine-managed files found (set "filter=glassine" in .gitattributes)'
 
   local old_hashes=()
   for f in "${files[@]}"; do
@@ -806,7 +821,7 @@ cmd_rotate() { # [paths...]
   fi
 
   ensure_tmpdir
-  local blob="$GLASSINE_TMPDIR/rotate_blob" i new rotated=0 stale='' drifted=''
+  local blob="$GLASSINE_TMPDIR/rotate_blob" i new rotated=0 stale='' drifted='' unfiltered=''
   for i in "${!files[@]}"; do
     f=${files[$i]}
     new=$(git ls-files -s -- "$f" | awk '{print $2}')
@@ -825,7 +840,9 @@ cmd_rotate() { # [paths...]
     [ -s "$blob" ] || continue # empty files pass through unencrypted by design
     policy=''
     [ "$policy_loaded" = 0 ] || policy=$(expected_keys "$f")
-    if [ -n "$policy" ] && [ "$(envelope_keys "$blob")" != "$policy" ]; then
+    if ! is_envelope "$blob"; then
+      unfiltered="$unfiltered $f"
+    elif [ -n "$policy" ] && [ "$(envelope_keys "$blob")" != "$policy" ]; then
       drifted="$drifted $f"
     else
       stale="$stale $f"
@@ -836,8 +853,11 @@ cmd_rotate() { # [paths...]
     printf 'glassine: re-encrypted %d file(s) with fresh data keys — review and commit\n' "$rotated"
   [ -z "$stale" ] ||
     warn "data keys NOT refreshed for:$stale — worktree copies are ciphertext this host cannot decrypt"
+  [ -z "$unfiltered" ] ||
+    warn "cannot re-encrypt:$unfiltered — the glassine filter never encrypted these; run \"glassine init\", then rotate again"
   [ -z "$drifted" ] ||
-    die "cannot re-encrypt:$drifted — recipients changed but no local key can decrypt the old envelope; run rotate on a host holding a previous recipient key"
+    warn "cannot re-encrypt:$drifted — recipients changed but no local key can decrypt the old envelope; run rotate on a host holding a previous recipient key"
+  [ -z "$unfiltered$drifted" ] || exit 1
 }
 
 # Verify every staged managed file is an envelope, and (for a glassine-managed
