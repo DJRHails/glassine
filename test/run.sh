@@ -105,12 +105,19 @@ git_q clone "$ORIGIN" "$KEYLESS"
   git config user.name test && git config user.email test@example.invalid
   grep -q 'ENC\[AES256_GCM' secrets/creds.yaml ||
     fail 'keyless clone does not see ciphertext'
-  SOPS_AGE_SSH_PRIVATE_KEY_FILE="$WORK/keys/missing" glassine init >/dev/null 2>&1
+  INIT_OUT=$(SOPS_AGE_SSH_PRIVATE_KEY_FILE="$WORK/keys/missing" glassine init 2>&1)
+  case "$INIT_OUT" in
+  *'decrypted'*) fail 'keyless init claimed it decrypted files it could not' ;;
+  esac
+  case "$INIT_OUT" in
+  *'still ciphertext'*) : ;;
+  *) fail 'keyless init did not warn about still-ciphertext files' ;;
+  esac
   touch secrets/creds.yaml
   [ -z "$(SOPS_AGE_SSH_PRIVATE_KEY_FILE=$WORK/keys/missing git status --porcelain)" ] ||
     fail 'envelope did not round-trip cleanly on a keyless host'
 )
-ok 'keyless clone sees ciphertext and round-trips it unchanged'
+ok 'keyless clone sees ciphertext and round-trips it unchanged, warning not claiming decryption'
 
 # --- 5: keyed clone — init decrypts the worktree ------------------------------
 
@@ -655,7 +662,197 @@ git_q clone "$ORIGIN" "$IDCLONE"
 )
 ok 'git config glassine.identity decrypts keys at non-default paths'
 
-# --- 32: rotate before init fails with guidance, not a false report ---------------
+# --- 32: glassine.identity stored with a literal '~' ------------------------------
+# A quoted `git config glassine.identity '~/key'` stores the tilde verbatim;
+# glassine reads the value with --type=path so git's own expansion resolves it
+# against $HOME (the hand-rolled substitute mangled ~user/... paths).
+
+(
+  cd "$IDCLONE"
+  cp "$WORK/keys/hosta" "$WORK/nokeys/id_github"
+  # shellcheck disable=SC2088 # the unexpanded tilde is the case under test
+  git config glassine.identity '~/id_github' # stored verbatim, expanded at read time
+  touch secrets/creds.yaml
+  [ -z "$(HOME="$WORK/nokeys" git status --porcelain)" ] ||
+    fail 'literal-~ glassine.identity did not resolve against HOME'
+)
+ok 'glassine.identity expands a literal ~ against HOME'
+
+# --- 33: glassine.identity that cannot resolve -------------------------------------
+# An unexpandable value (~nouser/...) makes `git config --type=path` die with
+# exit 128 ("failed to expand user dir"); glassine must catch that, warn with
+# the verbatim configured value (the hand-rolled expansion printed a mangled
+# ${HOME}nouser/... path instead), and keep git operations working rather than
+# letting the failure kill the filter.
+
+(
+  cd "$IDCLONE"
+  # shellcheck disable=SC2088 # the unexpandable tilde is the case under test
+  git config glassine.identity '~glassine-nouser/id_github'
+  touch secrets/creds.yaml
+  HOME="$WORK/nokeys" git status --porcelain >/dev/null 2>"$WORK/idwarn.err" ||
+    fail 'git status must survive an unresolvable glassine.identity'
+  grep -qF '~glassine-nouser/id_github' "$WORK/idwarn.err" ||
+    fail 'identity warning does not quote the verbatim configured value'
+)
+ok 'unresolvable glassine.identity warns verbatim and degrades gracefully'
+
+# --- 34: ~/.ssh scan — recipient-matched keys at any name decrypt and get pinned ---
+# No glassine.identity config, no default-named keys: decrypt_to must scan
+# ~/.ssh, match public halves against the envelope's recipients, decrypt with
+# the winner, and pin it in git config for the fast path.
+
+HOME4="$WORK/home4"
+mkdir -p "$HOME4/.ssh"
+ssh-keygen -t ed25519 -N '' -C 'dh@oddname' -f "$HOME4/.ssh/id_github" -q
+ssh-keygen -t ed25519 -N '' -C 'dh@decoy' -f "$HOME4/.ssh/id_decoy" -q # never a recipient
+(
+  r="$WORK/scanrepo"
+  mkdir -p "$r" && cd "$r"
+  git_q init
+  git config user.name test && git config user.email test@example.invalid
+  HOME=$HOME4 glassine init >/dev/null 2>&1
+  HOME=$HOME4 glassine protect 'secrets/**' >/dev/null 2>&1
+  HOME=$HOME4 glassine allow "$HOME4/.ssh/id_github.pub" >/dev/null 2>&1
+  mkdir secrets && echo 'k1: scanme' >secrets/s.yaml
+  HOME=$HOME4 git add . && HOME=$HOME4 git commit -qm base # encryption needs only public keys
+  rm secrets/s.yaml
+  git cat-file blob :secrets/s.yaml >secrets/s.yaml # ciphertext worktree, as after a clone
+  # The commit usually pins the key already (its racy-clean re-hash re-runs
+  # clean, whose memoisation decrypts via the scan) — but only when git
+  # considers the index entry racy, which is timing-dependent. Unset
+  # tolerantly so this exercises init's decrypt-and-pin from scratch either way.
+  git config --unset glassine.identity 2>/dev/null || true
+  HOME=$HOME4 glassine init >/dev/null 2>&1
+  grep -q 'k1: scanme' secrets/s.yaml ||
+    fail 'scan did not find the recipient-matched key in ~/.ssh'
+  [ "$(git config glassine.identity)" = "$HOME4/.ssh/id_github" ] ||
+    fail 'winning key was not pinned as glassine.identity'
+)
+ok 'ssh-key scan decrypts via recipient match and pins glassine.identity'
+
+# --- 35: allow --path — folder-scoped recipients -----------------------------
+# The scoped rule is seeded with the repo-wide recipients (grants only widen
+# access), sits before the catch-all (sops takes the first match), and only
+# its own files rotate.
+
+ssh-keygen -t ed25519 -N '' -C 'dh@guest' -f "$WORK/keys/guest" -q
+(
+  cd "$(mk_managed pathallow)"
+  g3 glassine protect 'config/**' >/dev/null 2>&1
+  mkdir config && echo 'c: 1' >config/c.yaml
+  g3 git add . && g3 git commit -qm config
+  SECRETS_BLOB=$(git rev-parse :secrets/s.yaml)
+
+  g3 glassine allow --path 'config/**' "$WORK/keys/guest.pub" >/dev/null 2>&1 ||
+    fail 'allow --path failed'
+  grep -qF '# glob: config/**' .sops.yaml ||
+    fail 'scoped rule does not record its glob'
+  awk '/^  - path_regex:/{p=NR} /^  - key_groups:/{c=NR} END{exit !(p && c && p<c)}' .sops.yaml ||
+    fail 'scoped rule is not ordered before the catch-all'
+
+  git cat-file blob :config/c.yaml >"$WORK/pp.enc"
+  as_host guest sops decrypt --filename-override config/c.yaml "$WORK/pp.enc" >/dev/null 2>&1 ||
+    fail 'guest cannot decrypt inside the granted path'
+  git cat-file blob :secrets/s.yaml >"$WORK/pp2.enc"
+  if as_host guest sops decrypt --filename-override secrets/s.yaml "$WORK/pp2.enc" >/dev/null 2>&1; then
+    fail 'guest can decrypt outside the granted path'
+  fi
+  SOPS_AGE_SSH_PRIVATE_KEY_FILE="$HOME3/.ssh/id_ed25519" \
+    sops decrypt --filename-override config/c.yaml "$WORK/pp.enc" >/dev/null 2>&1 ||
+    fail 'repo-wide recipient lost access to the scoped path'
+  [ "$(git rev-parse :secrets/s.yaml)" = "$SECRETS_BLOB" ] ||
+    fail 'scoped allow rotated files outside its path'
+  g3 glassine check >/dev/null 2>&1 || fail 'check reports drift after allow --path'
+  g3 git add -A && g3 git commit -qm 'grant config to guest'
+)
+ok 'allow --path scopes a recipient to a folder and rotates only it'
+
+# --- 36: global allow propagates into scoped rules ----------------------------
+
+ssh-keygen -t ed25519 -N '' -C 'dh@fleet' -f "$WORK/keys/fleet" -q
+(
+  cd "$WORK/pathallow"
+  g3 glassine allow "$WORK/keys/fleet.pub" >/dev/null 2>&1 || fail 'global allow failed'
+  [ "$(grep -cF "$(cut -d' ' -f2 "$WORK/keys/fleet.pub")" .sops.yaml)" = '2' ] ||
+    fail 'global allow did not propagate into the scoped rule'
+  for f in config/c.yaml secrets/s.yaml; do
+    git cat-file blob ":$f" >"$WORK/fleet.enc"
+    as_host fleet sops decrypt --filename-override "$f" "$WORK/fleet.enc" >/dev/null 2>&1 ||
+      fail "fleet key cannot decrypt $f after global allow"
+  done
+  g3 glassine check >/dev/null 2>&1 || fail 'drift after a propagating allow'
+  g3 git add -A && g3 git commit -qm 'allow fleet'
+)
+ok 'global allow lands in the catch-all and every scoped rule'
+
+# --- 37: per-path recipient drift — check flags it, rotate heals ----------------
+# Mimic a merge that changed policy without rotating: hand-add a recipient to
+# the scoped rule only, so its envelopes no longer match their own rule.
+
+ssh-keygen -t ed25519 -N '' -C 'dh@drift' -f "$WORK/keys/drift" -q
+(
+  cd "$WORK/pathallow"
+  awk -v key="          - '$(cut -d' ' -f1-2 "$WORK/keys/drift.pub")' # drift" '
+    /# glob: config\/\*\*/ { inrule = 1 }
+    { print }
+    inrule && !done && /- age:[[:space:]]*$/ { print key; done = 1 }
+  ' .sops.yaml >"$WORK/drift.yaml" && cat "$WORK/drift.yaml" >.sops.yaml
+  if g3 glassine check >/dev/null 2>&1; then
+    fail 'check missed per-path recipient drift'
+  fi
+  g3 glassine rotate >/dev/null 2>&1 || fail 'rotate failed on per-path drift'
+  g3 glassine check >/dev/null 2>&1 || fail 'check still failing after rotate'
+  git cat-file blob :config/c.yaml >"$WORK/drift.enc"
+  as_host drift sops decrypt --filename-override config/c.yaml "$WORK/drift.enc" >/dev/null 2>&1 ||
+    fail 'hand-added recipient cannot decrypt after the heal'
+  g3 git add -A && g3 git commit -qm 'heal path drift'
+)
+ok 'per-path drift: check flags it, rotate heals under the right rule'
+
+# --- 38: revoke --path removes scoped access; rules never empty ------------------
+
+(
+  cd "$WORK/pathallow"
+  g3 glassine revoke --path 'config/**' guest >/dev/null 2>&1 || fail 'revoke --path failed'
+  grep -qF "$(cut -d' ' -f2 "$WORK/keys/guest.pub")" .sops.yaml &&
+    fail 'revoke --path left the guest in .sops.yaml'
+  git cat-file blob :config/c.yaml >"$WORK/rvk.enc"
+  if as_host guest sops decrypt --filename-override config/c.yaml "$WORK/rvk.enc" >/dev/null 2>&1; then
+    fail 'revoked guest still decrypts the scoped path'
+  fi
+  g3 glassine check >/dev/null 2>&1 || fail 'drift after revoke --path'
+  if g3 glassine revoke 'ssh-ed25519' >/dev/null 2>&1; then
+    fail 'revoke emptied a rule'
+  fi
+  g3 git add -A && g3 git commit -qm 'revoke guest from config'
+)
+ok 'revoke --path removes scoped access; rules never empty'
+
+# --- 39: allow --path warns when the glob matches no managed files ----------------
+
+ssh-keygen -t ed25519 -N '' -C 'dh@lost' -f "$WORK/keys/lost" -q
+(
+  cd "$WORK/pathallow"
+  g3 glassine allow --path 'nowhere/**' "$WORK/keys/lost.pub" >/dev/null 2>"$WORK/lost.err" ||
+    fail 'allow --path on an unprotected glob must still succeed'
+  grep -q 'matches no glassine-managed files' "$WORK/lost.err" ||
+    fail 'no warning for a glob that matches nothing'
+)
+ok 'allow --path warns when the glob matches no managed files'
+
+# --- 40: duplicate allow --path skips rotation -------------------------------------
+
+(
+  cd "$WORK/pathallow"
+  BLOB=$(git rev-parse :config/c.yaml)
+  g3 glassine allow --path 'config/**' "$WORK/keys/fleet.pub" >/dev/null 2>&1 || true
+  [ "$(git rev-parse :config/c.yaml)" = "$BLOB" ] ||
+    fail 'duplicate scoped allow still rotated'
+)
+ok 'duplicate allow --path skips rotation'
+
+# --- 41: rotate before init fails with guidance, not a false report ---------------
 # With no filter configured, renormalize is a no-op and the staged blobs stay
 # plaintext. Rotate must fail loudly pointing at init — not exit 0 claiming
 # undecryptable ciphertext, and not claim recipient drift.
