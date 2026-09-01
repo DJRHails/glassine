@@ -29,7 +29,7 @@ curl -fsSL https://raw.githubusercontent.com/DJRHails/glassine/main/glassine \
   -o ~/.local/bin/glassine && chmod +x ~/.local/bin/glassine
 ```
 
-Requires `git` and [`sops`](https://github.com/getsops/sops) ≥ 3.10
+Requires `git` ≥ 2.25 and [`sops`](https://github.com/getsops/sops) ≥ 3.10
 (`brew install sops`).
 
 ## Quickstart

@@ -110,8 +110,8 @@ git_q clone "$ORIGIN" "$KEYLESS"
   *'decrypted'*) fail 'keyless init claimed it decrypted files it could not' ;;
   esac
   case "$INIT_OUT" in
-  *'still ciphertext'*) : ;;
-  *) fail 'keyless init did not warn about still-ciphertext files' ;;
+  *'still ciphertext'*': secrets/creds.yaml'*) : ;;
+  *) fail "keyless init did not list secrets/creds.yaml as still ciphertext: $INIT_OUT" ;;
   esac
   touch secrets/creds.yaml
   [ -z "$(SOPS_AGE_SSH_PRIVATE_KEY_FILE=$WORK/keys/missing git status --porcelain)" ] ||
@@ -869,5 +869,63 @@ ok 'duplicate allow --path skips rotation'
   fi
 )
 ok 'rotate before init fails with init guidance instead of a false report'
+
+# --- 42: init refreshes every stale envelope in ONE checkout, names taken literally
+# A per-file `git checkout -- <f>` paid a git start-up, an index write and a
+# clean-filter re-verify of every racy entry per envelope (~90 ms around an
+# ~8 ms decrypt; a 525-envelope clone spent 40 s in init). The refresh is one
+# checkout over the still-ciphertext list, each path a :(literal) pathspec so
+# brackets and spaces in filenames name exactly that file. A PATH shim counts
+# the checkouts git is asked for.
+
+BATCH="$WORK/batchorigin"
+mkdir -p "$WORK/gitshim"
+REAL_GIT=$(command -v git)
+cat >"$WORK/gitshim/git" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$1" >>"$WORK/gitcalls"
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$WORK/gitshim/git"
+mkdir -p "$BATCH"
+(
+  cd "$BATCH"
+  git_q init
+  git config user.name test && git config user.email test@example.invalid
+  cp "$ORIGIN/.sops.yaml" .sops.yaml
+  echo 'secrets/** filter=glassine diff=glassine merge=binary' >.gitattributes
+  glassine init >/dev/null 2>&1
+  mkdir secrets
+  echo 'bracket: demo-bracket' >'secrets/[x].yaml'
+  echo 'plain: demo-plain' >'secrets/x.yaml'
+  echo 'spaced: demo-spaced' >'secrets/with space.yaml'
+  as_host hosta git add .
+  as_host hosta git commit -qm 'awkward names'
+)
+git_q clone "$BATCH" "$WORK/clone-batch"
+(
+  cd "$WORK/clone-batch"
+  git config user.name test && git config user.email test@example.invalid
+  grep -q 'ENC\[AES256_GCM' 'secrets/[x].yaml' ||
+    fail 'clone did not land the bracket-named envelope as ciphertext'
+  : >"$WORK/gitcalls"
+  INIT_OUT=$(PATH="$WORK/gitshim:$PATH" as_host hosta glassine init 2>&1) ||
+    fail "init aborted on an awkward filename: $INIT_OUT"
+  [ "$(grep -c '^checkout$' "$WORK/gitcalls")" = 1 ] ||
+    fail "init refreshed 3 envelopes with $(grep -c '^checkout$' "$WORK/gitcalls") checkouts, not one"
+  grep -q 'bracket: demo-bracket' 'secrets/[x].yaml' ||
+    fail 'init left the bracket-named envelope encrypted'
+  grep -q 'spaced: demo-spaced' 'secrets/with space.yaml' ||
+    fail 'init left the space-named envelope encrypted'
+  grep -q 'plain: demo-plain' 'secrets/x.yaml' ||
+    fail 'init left the plain-named envelope encrypted'
+  case "$INIT_OUT" in
+  *'decrypted 3 file(s)'*) : ;;
+  *) fail "init miscounted the refresh: $INIT_OUT" ;;
+  esac
+  [ -z "$(as_host hosta git status --porcelain)" ] ||
+    fail 'batched refresh left the worktree dirty'
+)
+ok 'init refreshes bracket- and space-named envelopes literally in one pass'
 
 printf '\nall %d tests passed\n' "$PASS"
