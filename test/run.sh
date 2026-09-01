@@ -110,8 +110,8 @@ git_q clone "$ORIGIN" "$KEYLESS"
   *'decrypted'*) fail 'keyless init claimed it decrypted files it could not' ;;
   esac
   case "$INIT_OUT" in
-  *'still ciphertext'*) : ;;
-  *) fail 'keyless init did not warn about still-ciphertext files' ;;
+  *'still ciphertext'*': secrets/creds.yaml'*) : ;;
+  *) fail "keyless init did not list secrets/creds.yaml as still ciphertext: $INIT_OUT" ;;
   esac
   touch secrets/creds.yaml
   [ -z "$(SOPS_AGE_SSH_PRIVATE_KEY_FILE=$WORK/keys/missing git status --porcelain)" ] ||
