@@ -753,22 +753,37 @@ cmd_init() {
 
   # Refresh worktree copies that are still ciphertext (e.g. right after
   # cloning, before the filter existed). Note: checkout-index bypasses smudge
-  # filters, so delete + checkout is the reliable re-smudge idiom.
+  # filters, so delete + checkout is the reliable re-smudge idiom — as ONE
+  # checkout over the whole list, not one per file: each `git checkout -- <f>`
+  # pays a git start-up and an index write, and re-verifies every still-racy
+  # index entry through its clean filter, so a 525-envelope clone spent ~40 s
+  # on ~90 ms of per-file overhead around an ~8 ms decrypt (one checkout: ~7 s).
+  # Paths are handed over as :(literal) so a glob character in a filename
+  # names exactly that file, never a pattern over its siblings.
   ensure_tmpdir
   local f refreshed=0 opaque=''
+  local stale="$GLASSINE_TMPDIR/stale" pathspecs="$GLASSINE_TMPDIR/stale_pathspecs"
+  : >"$stale"
+  : >"$pathspecs"
   while IFS= read -r -d '' f; do
     if [ -f "$root/$f" ] && is_envelope "$root/$f"; then
-      rm -f -- "$root/$f"
-      git checkout -- "$f"
-      # The smudge filter passes ciphertext through when no identity matches
-      # the envelope's recipients, so re-check before claiming success.
-      if is_envelope "$root/$f"; then
-        opaque="$opaque $f"
+      printf '%s\0' "$root/$f" >>"$stale"
+      printf ':(literal)%s\0' "$f" >>"$pathspecs"
+    fi
+  done < <(managed_files)
+  if [ -s "$stale" ]; then
+    xargs -0 rm -f -- <"$stale"
+    git checkout --pathspec-from-file="$pathspecs" --pathspec-file-nul --
+    # The smudge filter passes ciphertext through when no identity matches
+    # the envelope's recipients, so re-check before claiming success.
+    while IFS= read -r -d '' f; do
+      if is_envelope "$f"; then
+        opaque="$opaque ${f#"$root/"}"
       else
         refreshed=$((refreshed + 1))
       fi
-    fi
-  done < <(managed_files)
+    done <"$stale"
+  fi
   [ "$refreshed" -eq 0 ] || printf 'glassine: decrypted %d file(s) into the working tree\n' "$refreshed"
   [ -z "$opaque" ] || warn "still ciphertext (no identity on this host matches their recipients):$opaque"
 
