@@ -928,4 +928,103 @@ git_q clone "$BATCH" "$WORK/clone-batch"
 )
 ok 'init refreshes bracket- and space-named envelopes literally in one pass'
 
+# --- 43: init leaves envelopes none of the host's keys can open untouched -----------
+# A host whose only key pair is a recipient of nothing (no env identity, no
+# default-named key): every envelope is unopenable, so init must wire the
+# filters and list them as still ciphertext WITHOUT the delete-and-re-smudge
+# refresh — which would fail one sops call per envelope for nothing. The sops
+# shim proves no decrypt was attempted.
+
+mkdir -p "$WORK/sopsshim" "$WORK/strangerhome/.ssh"
+REAL_SOPS=$(command -v sops)
+cat >"$WORK/sopsshim/sops" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$WORK/sopscalls"
+exec "$REAL_SOPS" "\$@"
+EOF
+chmod +x "$WORK/sopsshim/sops"
+ssh-keygen -t ed25519 -N '' -C 'stranger' -f "$WORK/strangerhome/.ssh/id_stranger" -q
+git_q clone "$ORIGIN" "$WORK/clone-stranger"
+(
+  cd "$WORK/clone-stranger"
+  git config user.name test && git config user.email test@example.invalid
+  : >"$WORK/sopscalls"
+  INIT_OUT=$(HOME="$WORK/strangerhome" PATH="$WORK/sopsshim:$PATH" glassine init 2>&1) ||
+    fail "init failed on a host with no matching key: $INIT_OUT"
+  [ ! -s "$WORK/sopscalls" ] ||
+    fail "init attempted $(wc -l <"$WORK/sopscalls") decrypt(s) of envelopes no local key can open"
+  grep -q 'ENC\[AES256_GCM' secrets/creds.yaml ||
+    fail 'init altered an envelope it could not open'
+  case "$INIT_OUT" in
+  *'decrypted'*) fail 'init claimed a decrypt with no matching key' ;;
+  esac
+  case "$INIT_OUT" in
+  *'still ciphertext'*': secrets/creds.yaml'*) : ;;
+  *) fail "init did not list the unopenable envelope as still ciphertext: $INIT_OUT" ;;
+  esac
+  [ "$(git config filter.glassine.clean)" = 'glassine clean %f' ] ||
+    fail 'init skipped wiring the filters along with the refresh'
+  [ -z "$(HOME="$WORK/strangerhome" git status --porcelain)" ] ||
+    fail 'the untouched envelopes read as dirty'
+)
+ok 'init leaves unopenable envelopes untouched — filters wired, listed, no decrypt attempted'
+
+# --- 44: mixed recipients — init refreshes exactly the envelopes a local key opens --
+# secrets/shared.yaml names hosta and hostb; secrets/hostb-only.yaml names hostb
+# alone (a scoped rule). A host holding only hosta's pair under a non-default
+# name (found by the ~/.ssh scan, no env identity) must decrypt the first and
+# leave the second listed — and never hand the second to sops.
+
+MIXED="$WORK/mixedorigin"
+mkdir -p "$MIXED" "$WORK/hostahome/.ssh"
+cp "$WORK/keys/hosta" "$WORK/hostahome/.ssh/id_hosta"
+cp "$WORK/keys/hosta.pub" "$WORK/hostahome/.ssh/id_hosta.pub"
+(
+  cd "$MIXED"
+  git_q init
+  git config user.name test && git config user.email test@example.invalid
+  cat >.sops.yaml <<EOF
+creation_rules:
+  - path_regex: secrets/hostb-only\\.yaml
+    key_groups:
+      - age:
+          - '$(cut -d' ' -f1-2 "$WORK/keys/hostb.pub")'
+  - path_regex: secrets/.*
+    key_groups:
+      - age:
+          - '$(cut -d' ' -f1-2 "$WORK/keys/hosta.pub")'
+          - '$(cut -d' ' -f1-2 "$WORK/keys/hostb.pub")'
+EOF
+  echo 'secrets/** filter=glassine diff=glassine merge=binary' >.gitattributes
+  glassine init >/dev/null 2>&1
+  mkdir secrets
+  echo 'shared: demo-shared' >secrets/shared.yaml
+  echo 'private: demo-hostb' >secrets/hostb-only.yaml
+  as_host hostb git add .
+  as_host hostb git commit -qm 'mixed recipients'
+)
+git_q clone "$MIXED" "$WORK/clone-mixed"
+(
+  cd "$WORK/clone-mixed"
+  git config user.name test && git config user.email test@example.invalid
+  : >"$WORK/sopscalls"
+  INIT_OUT=$(HOME="$WORK/hostahome" PATH="$WORK/sopsshim:$PATH" glassine init 2>&1) ||
+    fail "init failed on the mixed-recipient clone: $INIT_OUT"
+  grep -q 'shared: demo-shared' secrets/shared.yaml ||
+    fail 'init did not decrypt the envelope hosta can open'
+  grep -q 'ENC\[AES256_GCM' secrets/hostb-only.yaml ||
+    fail 'init altered the hostb-only envelope'
+  ! grep -q 'hostb-only' "$WORK/sopscalls" ||
+    fail 'init handed the hostb-only envelope to sops'
+  case "$INIT_OUT" in
+  *'decrypted 1 file(s)'*) : ;;
+  *) fail "init miscounted the mixed refresh: $INIT_OUT" ;;
+  esac
+  case "$INIT_OUT" in
+  *'still ciphertext'*': secrets/hostb-only.yaml'*) : ;;
+  *) fail "init did not list hostb-only.yaml as still ciphertext: $INIT_OUT" ;;
+  esac
+)
+ok 'init refreshes exactly the envelopes a scanned key opens; the rest are listed'
+
 printf '\nall %d tests passed\n' "$PASS"
