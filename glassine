@@ -186,8 +186,8 @@ partition_openable() { # <envelopes> <openable> <opaque>
   fi
   # grep exits 1 when a batch has no match (-l) or every file matches (-L);
   # xargs folds that into 123 — neither is a fault, so judge by the counts.
-  xargs -0 grep -laFZ -f "$materials" -- <"$envelopes" >"$openable" || true
-  xargs -0 grep -LaFZ -f "$materials" -- <"$envelopes" >"$opaque" || true
+  xargs -0 grep -laF --null -f "$materials" -- <"$envelopes" >"$openable" || true
+  xargs -0 grep -LaF --null -f "$materials" -- <"$envelopes" >"$opaque" || true
   local total split
   total=$(tr -cd '\0' <"$envelopes" | wc -c)
   split=$(cat "$openable" "$opaque" | tr -cd '\0' | wc -c)
