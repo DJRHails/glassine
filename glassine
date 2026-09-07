@@ -10,7 +10,7 @@
 # https://github.com/DJRHails/glassine
 set -euo pipefail
 
-readonly VERSION='0.7.1'
+readonly VERSION='0.7.2'
 
 GLASSINE_TMPDIR=''
 
@@ -129,11 +129,7 @@ maybe_export_identity() {
 # keys.txt in either the macOS or XDG location, or any SSH key pair in ~/.ssh
 # (decrypt_to scans those against each envelope's recipients).
 has_identity() {
-  [ -n "${SOPS_AGE_SSH_PRIVATE_KEY_FILE:-}" ] && return 0
-  [ -n "${SOPS_AGE_KEY:-}${SOPS_AGE_KEY_FILE:-}${SOPS_AGE_KEY_CMD:-}" ] && return 0
-  [ -f "$HOME/.ssh/id_ed25519" ] || [ -f "$HOME/.ssh/id_rsa" ] && return 0
-  [ -f "$HOME/Library/Application Support/sops/age/keys.txt" ] && return 0
-  [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt" ] && return 0
+  has_blind_identity && return 0
   local pub
   for pub in "$HOME"/.ssh/*.pub; do
     if [ -f "$pub" ] && [ -f "${pub%.pub}" ]; then
@@ -141,6 +137,65 @@ has_identity() {
     fi
   done
   return 1
+}
+
+# The identities sops resolves on its own — an env var, a default-named SSH
+# key, an age keys.txt. Which envelopes THEY open cannot be read off the
+# envelope (an age key's recipient is not ssh material), so a caller that
+# wants to know up front must treat every envelope as openable when one of
+# these is present; only the ~/.ssh pair scan (decrypt_to) is decidable in
+# advance, by the recipient material an envelope carries verbatim.
+has_blind_identity() {
+  [ -n "${SOPS_AGE_SSH_PRIVATE_KEY_FILE:-}" ] && return 0
+  [ -n "${SOPS_AGE_KEY:-}${SOPS_AGE_KEY_FILE:-}${SOPS_AGE_KEY_CMD:-}" ] && return 0
+  [ -f "$HOME/.ssh/id_ed25519" ] || [ -f "$HOME/.ssh/id_rsa" ] && return 0
+  [ -f "$HOME/Library/Application Support/sops/age/keys.txt" ] && return 0
+  [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt" ] && return 0
+  return 1
+}
+
+# Split a NUL-separated envelope list into the ones some identity here can
+# open (<openable>) and the rest (<opaque>). With a blind identity present
+# everything is openable as far as we can tell. Otherwise an envelope is
+# openable iff it names a ~/.ssh key pair's public material — one fixed-string
+# grep over the whole list, the same match decrypt_to makes per file. Any
+# fault in the split (a grep error dropping files) falls back to "all
+# openable", the behaviour before the split existed.
+partition_openable() { # <envelopes> <openable> <opaque>
+  local envelopes=$1 openable=$2 opaque=$3
+  : >"$openable"
+  : >"$opaque"
+  [ -s "$envelopes" ] || return 0
+  if has_blind_identity; then
+    cat "$envelopes" >"$openable"
+    return 0
+  fi
+  local materials="$GLASSINE_TMPDIR/materials" pub key material
+  : >"$materials"
+  for pub in "$HOME"/.ssh/*.pub; do
+    key=${pub%.pub}
+    [ -f "$pub" ] || continue
+    [ -f "$key" ] || continue
+    material=$(cut -d' ' -f2 "$pub" 2>/dev/null || true)
+    [ -n "$material" ] || continue
+    printf '%s\n' "$material" >>"$materials"
+  done
+  if [ ! -s "$materials" ]; then
+    cat "$envelopes" >"$opaque"
+    return 0
+  fi
+  # grep exits 1 when a batch has no match (-l) or every file matches (-L);
+  # xargs folds that into 123 — neither is a fault, so judge by the counts.
+  xargs -0 grep -laF --null -f "$materials" -- <"$envelopes" >"$openable" || true
+  xargs -0 grep -LaF --null -f "$materials" -- <"$envelopes" >"$opaque" || true
+  local total split
+  total=$(tr -cd '\0' <"$envelopes" | wc -c)
+  split=$(cat "$openable" "$opaque" | tr -cd '\0' | wc -c)
+  if [ "$total" -ne "$split" ]; then
+    warn "could not tell which envelopes this host's keys open ($split of $total classified) — refreshing all"
+    cat "$envelopes" >"$openable"
+    : >"$opaque"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -760,17 +815,33 @@ cmd_init() {
   # on ~90 ms of per-file overhead around an ~8 ms decrypt (one checkout: ~7 s).
   # Paths are handed over as :(literal) so a glob character in a filename
   # names exactly that file, never a pattern over its siblings.
+  #
+  # Only envelopes an identity here can open are refreshed at all. The smudge
+  # passes an unopenable envelope through as ciphertext, so refreshing it
+  # deletes and re-checks-out the file for nothing — through a sops call that
+  # fails, ~40 ms apiece: a 525-envelope clone whose recipients named none of
+  # the host's keys spent ~20 s decrypting nothing on every clone (the gantry
+  # worker checkout, [perf-bestofn] 2026-09-07). partition_openable decides
+  # that up front from the recipient material the envelopes carry; the ones
+  # it leaves out are reported exactly as a failed refresh would report them.
   ensure_tmpdir
   local f refreshed=0 opaque=''
   local stale="$GLASSINE_TMPDIR/stale" pathspecs="$GLASSINE_TMPDIR/stale_pathspecs"
-  : >"$stale"
-  : >"$pathspecs"
+  local envelopes="$GLASSINE_TMPDIR/stale_envelopes" unopenable="$GLASSINE_TMPDIR/stale_unopenable"
+  : >"$envelopes"
   while IFS= read -r -d '' f; do
     if [ -f "$root/$f" ] && is_envelope "$root/$f"; then
-      printf '%s\0' "$root/$f" >>"$stale"
-      printf ':(literal)%s\0' "$f" >>"$pathspecs"
+      printf '%s\0' "$root/$f" >>"$envelopes"
     fi
   done < <(managed_files)
+  partition_openable "$envelopes" "$stale" "$unopenable"
+  : >"$pathspecs"
+  while IFS= read -r -d '' f; do
+    printf ':(literal)%s\0' "${f#"$root/"}" >>"$pathspecs"
+  done <"$stale"
+  while IFS= read -r -d '' f; do
+    opaque="$opaque ${f#"$root/"}"
+  done <"$unopenable"
   if [ -s "$stale" ]; then
     xargs -0 rm -f -- <"$stale"
     git checkout --pathspec-from-file="$pathspecs" --pathspec-file-nul --

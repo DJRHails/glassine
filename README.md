@@ -52,9 +52,10 @@ pair matching the envelope's recipients and pins the winner as
 `git config glassine.identity` (override with
 `SOPS_AGE_SSH_PRIVATE_KEY_FILE`).
 
-On a fresh clone, `glassine init` decrypts the working tree in place.
-Keyless clones simply see envelopes — they round-trip safely and can never
-corrupt or leak anything.
+On a fresh clone, `glassine init` decrypts the working tree in place — only
+the envelopes one of your keys can open; the rest are left as they are and
+listed, never re-smudged for nothing. Keyless clones simply see envelopes —
+they round-trip safely and can never corrupt or leak anything.
 
 ## Sharing and revoking access
 
