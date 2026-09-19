@@ -810,9 +810,11 @@ cmd_refresh_envelope() { # <root> <cache> <file>
   fi
 }
 
-# The clean filter init's index reconcile runs, written into the cache and
-# wired for that ONE git call via `-c` — the repository's own filter config
-# is never touched, so the cache can influence nothing but init's refresh.
+# The clean filter init's index reconcile runs, written beside the cache
+# (never inside it: the cache's tree is keyed by repo paths, so a managed
+# file named like the helper would collide with it) and wired for that ONE
+# git call via `-c` — the repository's own filter config is never touched,
+# so the cache can influence nothing but init's refresh.
 # POSIX sh rather than glassine itself because the reconcile invokes it once
 # per rewritten file, serially: bash starting and parsing this script is
 # ~6 ms of the ~9 ms a `glassine clean` fast path cost per file (525 files:
@@ -932,6 +934,7 @@ cmd_init() {
   local stale="$GLASSINE_TMPDIR/stale" pathspecs="$GLASSINE_TMPDIR/stale_pathspecs"
   local envelopes="$GLASSINE_TMPDIR/stale_envelopes" unopenable="$GLASSINE_TMPDIR/stale_unopenable"
   local cache="$GLASSINE_TMPDIR/refresh" fallback="$GLASSINE_TMPDIR/stale_fallback"
+  local helper="$GLASSINE_TMPDIR/refresh_clean.sh"
   local rewritten="$GLASSINE_TMPDIR/stale_rewritten" rewritten_n=0
   local present="$GLASSINE_TMPDIR/managed_present" still="$GLASSINE_TMPDIR/stale_still"
   : >"$present"
@@ -961,18 +964,19 @@ cmd_init() {
     done <"$stale"
     if [ "$rewritten_n" -gt 0 ]; then
       # ls-files --stage output is one of --index-info's accepted formats.
-      # -q must precede --refresh (it acts as soon as it is parsed) and keeps
-      # an unrelated locally-modified file from failing the reconcile.
+      # -q and --unmerged must precede --refresh (it acts as soon as it is
+      # parsed): -q keeps an unrelated locally-modified file from failing the
+      # reconcile, --unmerged an unrelated conflicted one (init mid-merge).
       xargs -0 git -C "$root" ls-files -sz --full-name -- <"$rewritten" |
         git -C "$root" update-index -z --index-info
-      write_refresh_clean "$cache/clean.sh"
+      write_refresh_clean "$helper"
       # git hands the command to `sh -c` with %f already single-quoted, so
       # the helper is sourced with the path in $p rather than exec'd as a
       # second sh: one process fewer per rewritten file. The value is
       # deliberately literal — the sh git spawns expands it.
       # shellcheck disable=SC2016
-      GLASSINE_REFRESH_CACHE=$cache git -C "$root" \
-        -c 'filter.glassine.clean=p=%f; . "$GLASSINE_REFRESH_CACHE/clean.sh"' update-index -q --refresh
+      GLASSINE_REFRESH_CACHE=$cache GLASSINE_REFRESH_CLEAN=$helper git -C "$root" \
+        -c 'filter.glassine.clean=p=%f; . "$GLASSINE_REFRESH_CLEAN"' update-index -q --unmerged --refresh
     fi
     if [ -s "$fallback" ]; then
       xargs -0 rm -f -- <"$fallback"

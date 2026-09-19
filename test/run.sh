@@ -1157,4 +1157,62 @@ git_q clone "$ORIGIN" "$WORK/clone-corrupt"
 )
 ok 'a corrupted cache envelope never reaches the index or a commit; plaintext survives'
 
+# --- 48: an envelope no worker lands takes the delete-and-checkout route ----------
+# refresh-envelope leaves no marker when it cannot install a file (no staged
+# blob, a worktree envelope that differs from the index, a failed write); init
+# must then hand every such file to the ONE literal-pathspec checkout the
+# refresh used to be. The shim turns every worker into a silent no-op, so the
+# whole stale list has to travel that route: exactly one checkout, plaintext
+# landed, index agreeing.
+
+cat >"$WORK/glassineshim/glassine" <<EOF
+#!/usr/bin/env bash
+[ "\$1" != refresh-envelope ] || exit 0
+exec "$REAL_GLASSINE" "\$@"
+EOF
+git_q clone "$ORIGIN" "$WORK/clone-fallback"
+(
+  cd "$WORK/clone-fallback"
+  git config user.name test && git config user.email test@example.invalid
+  ENVELOPES=$(git ls-files -z secrets | xargs -0 grep -lF 'ENC[AES256_GCM' -- | wc -l | tr -d ' ')
+  : >"$WORK/gitcalls"
+  INIT_OUT=$(PATH="$WORK/glassineshim:$WORK/gitshim:$PATH" as_host hosta glassine init 2>&1) ||
+    fail "init failed when no worker landed its envelope: $INIT_OUT"
+  [ "$(grep -c '^checkout$' "$WORK/gitcalls" || true)" = 1 ] ||
+    fail "the fallback ran $(grep -c '^checkout$' "$WORK/gitcalls" || true) checkouts for $ENVELOPES envelopes, not one"
+  case "$INIT_OUT" in
+  *"decrypted $ENVELOPES file(s)"*) : ;;
+  *) fail "init miscounted the fallback refresh: $INIT_OUT" ;;
+  esac
+  grep -q 'ghp_demo123' secrets/creds.yaml || fail 'the fallback checkout did not land the plaintext'
+  [ -z "$(as_host hosta git status --porcelain)" ] ||
+    fail "the fallback left the index disagreeing: $(as_host hosta git status --porcelain)"
+)
+ok 'an envelope no worker lands is refreshed by the one fallback checkout'
+
+# --- 49: init mid-merge — an unrelated conflict must not abort the reconcile -----
+# `update-index --refresh` errors out on an index holding unmerged entries
+# unless told --unmerged; -q does not cover it. A clone with a conflict in a
+# file glassine does not manage still has to decrypt its stale envelopes, and
+# leave the conflict exactly where it was.
+
+git_q clone "$ORIGIN" "$WORK/clone-conflict"
+(
+  cd "$WORK/clone-conflict"
+  git config user.name test && git config user.email test@example.invalid
+  MAIN=$(git rev-parse --abbrev-ref HEAD)
+  echo 'a' >notes.txt && git add notes.txt && git_q commit -m 'notes a'
+  git_q checkout -b side && echo 'b' >notes.txt && git_q commit -am 'notes b'
+  git_q checkout "$MAIN" && echo 'c' >notes.txt && git_q commit -am 'notes c'
+  git_q merge side || true
+  [ -n "$(git ls-files -u -- notes.txt)" ] || fail 'fixture did not leave notes.txt conflicted'
+  INIT_OUT=$(as_host hosta glassine init 2>&1) ||
+    fail "init aborted on an unrelated merge conflict: $INIT_OUT"
+  grep -q 'ghp_demo123' secrets/creds.yaml || fail 'init mid-merge left the secret encrypted'
+  [ -z "$(as_host hosta git status --porcelain -- secrets)" ] ||
+    fail "init mid-merge left secrets disagreeing with the index: $(as_host hosta git status --porcelain -- secrets)"
+  [ -n "$(git ls-files -u -- notes.txt)" ] || fail 'init resolved a conflict it does not own'
+)
+ok 'init decrypts around an unrelated merge conflict instead of aborting'
+
 printf '\nall %d tests passed\n' "$PASS"
