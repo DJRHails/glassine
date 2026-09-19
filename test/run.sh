@@ -1027,4 +1027,93 @@ git_q clone "$MIXED" "$WORK/clone-mixed"
 )
 ok 'init refreshes exactly the envelopes a scanned key opens; the rest are listed'
 
+# --- long-running filter process (45-48) ----------------------------------------
+# init wires filter.glassine.process; one glassine serves every file of a git
+# command and a checkout's smudges are delayed and decrypted in parallel.
+# GIT_TRACE_PACKET is git's own record of the exchange — status=delayed only
+# ever appears when the process took the delayed path.
+
+HOME4="$WORK/home4"
+mkdir -p "$HOME4/.ssh"
+ssh-keygen -t ed25519 -N '' -C 'dh@pool' -f "$HOME4/.ssh/id_ed25519" -q
+g4() { HOME=$HOME4 "$@"; }
+POOL="$WORK/poolorigin"
+mkdir -p "$POOL" && cd "$POOL"
+git_q init
+git config user.name test && git config user.email test@example.invalid
+g4 glassine init >/dev/null 2>&1
+g4 glassine protect 'secrets/**' >/dev/null 2>&1
+mkdir secrets
+for i in $(seq 1 12); do
+  printf 'key%d: value-%d\n' "$i" "$i" >"secrets/s$i.yaml"
+done
+printf 'a\000b\000\377\376\n\000z' >secrets/blob.bin
+: >secrets/empty.yaml
+g4 git add . && g4 git commit -qm pool
+git ls-files -z secrets | xargs -0 shasum -a 256 | sort -k2 >"$WORK/pool-manifest"
+git cat-file blob :secrets/blob.bin | grep -q 'ENC\[AES256_GCM' ||
+  fail 'the binary file was not staged as an envelope through the process filter'
+
+# --- 45: a clone's init decrypts every envelope through the delayed protocol ----
+
+git_q clone "$POOL" "$WORK/clone-pool"
+(
+  cd "$WORK/clone-pool"
+  git config user.name test && git config user.email test@example.invalid
+  GIT_TRACE_PACKET="$WORK/pool-trace" g4 glassine init >/dev/null 2>&1 || fail 'init failed on the pool clone'
+  [ "$(git config filter.glassine.process)" = 'glassine filter-process' ] ||
+    fail 'init did not configure filter.glassine.process'
+  [ "$(grep -c 'status=delayed' "$WORK/pool-trace")" -eq 13 ] ||
+    fail "expected 13 delayed smudges, got $(grep -c 'status=delayed' "$WORK/pool-trace")"
+  git ls-files -z secrets | xargs -0 shasum -a 256 | sort -k2 | diff -q - "$WORK/pool-manifest" >/dev/null ||
+    fail 'delayed smudge did not reproduce the plaintext byte for byte'
+  [ -z "$(g4 git status --porcelain)" ] || fail 'the delayed checkout left the index disagreeing with the worktree'
+)
+ok 'init decrypts a clone through one delayed filter process, byte for byte, index clean'
+
+# --- 46: binary plaintext with NULs round-trips through the process ---------------
+
+cmp -s "$POOL/secrets/blob.bin" "$WORK/clone-pool/secrets/blob.bin" ||
+  fail 'the binary plaintext changed on its way through clean and smudge'
+[ "$(wc -c <"$WORK/clone-pool/secrets/blob.bin")" -eq 9 ] ||
+  fail 'the binary plaintext lost bytes (NULs dropped?)'
+[ ! -s "$WORK/clone-pool/secrets/empty.yaml" ] || fail 'the empty file came back non-empty'
+ok 'a NUL-bearing binary plaintext and an empty file round-trip through the filter process'
+
+# --- 47: an envelope no local key opens passes through the process as ciphertext --
+
+git_q clone "$POOL" "$WORK/clone-pool-stranger"
+(
+  cd "$WORK/clone-pool-stranger"
+  git config user.name test && git config user.email test@example.invalid
+  HOME="$WORK/strangerhome" glassine init >/dev/null 2>&1 || fail 'keyless init failed on the pool clone'
+  rm secrets/s1.yaml
+  GIT_TRACE_PACKET="$WORK/stranger-trace" HOME="$WORK/strangerhome" git checkout -q -- secrets/s1.yaml ||
+    fail 'a keyless checkout through the process failed'
+  grep -q 'status=delayed' "$WORK/stranger-trace" || fail 'the keyless checkout did not go through the delayed process'
+  grep -q 'ENC\[AES256_GCM' secrets/s1.yaml || fail 'the process altered an envelope no local key opens'
+  git cat-file blob :secrets/s1.yaml | cmp -s - secrets/s1.yaml || fail 'the pass-through envelope is not byte-identical to the blob'
+)
+ok 'the process passes an unopenable envelope through as the exact ciphertext'
+
+# --- 48: a clean failure inside the process aborts the operation ------------------
+# A sops that cannot encrypt (here: one that exits 1) makes cmd_clean die; the
+# process must turn that into status=error so filter.glassine.required aborts
+# the add — the git add must fail and nothing may reach the index.
+
+mkdir -p "$WORK/failsops"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$WORK/failsops/sops"
+chmod +x "$WORK/failsops/sops"
+(
+  cd "$POOL"
+  echo 'token: leaks' >secrets/new.yaml
+  if GIT_TRACE_PACKET="$WORK/clean-trace" PATH="$WORK/failsops:$PATH" g4 git add secrets/new.yaml >/dev/null 2>&1; then
+    fail 'git add succeeded although sops could not encrypt'
+  fi
+  grep -q 'status=error' "$WORK/clean-trace" || fail 'the process did not answer status=error for the failed clean'
+  [ -z "$(git ls-files secrets/new.yaml)" ] || fail 'plaintext was staged despite the clean failure'
+  rm secrets/new.yaml
+)
+ok 'a clean failure in the process answers status=error and git stages nothing'
+
 printf '\nall %d tests passed\n' "$PASS"

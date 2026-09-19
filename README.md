@@ -147,6 +147,13 @@ Safety properties:
   is nothing to protect); `check` and `status` treat them accordingly
 - `git worktree add` works — secrets decrypt in new worktrees (filters are
   plain config, unlike transcrypt's per-worktree crypt directory)
+- checkouts decrypt in parallel: `init` also wires
+  `filter.glassine.process`, git's long-running filter protocol, so one
+  glassine process serves every file of a git command and a checkout's
+  envelopes are decrypted `GLASSINE_JOBS` (default: core count) at a time
+  under the `delay` capability — the same `clean`/`smudge` code paths,
+  including `required` aborting on a failed encrypt. git older than 2.11
+  ignores the key and runs the per-file filters.
 
 ## Limitations
 

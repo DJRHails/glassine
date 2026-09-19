@@ -10,7 +10,7 @@
 # https://github.com/DJRHails/glassine
 set -euo pipefail
 
-readonly VERSION='0.7.2'
+readonly VERSION='0.8.0'
 
 GLASSINE_TMPDIR=''
 
@@ -312,6 +312,370 @@ cmd_merge() { # <base %O> <ours %A> <theirs %B> <marker-size %L> <path %P>
     return 0
   fi
   return 1
+}
+
+# ---------------------------------------------------------------------------
+# long-running filter process (filter.glassine.process)
+# ---------------------------------------------------------------------------
+#
+# The per-file `glassine smudge %f` form pays a bash start-up (~6 ms parsing
+# this script), a mktemp and three or four small spawns around each ~13 ms
+# sops call, and git runs smudge filters strictly one file at a time — so a
+# 525-envelope clone spent ~13.5 s of `glassine init` inside the refresh
+# checkout, ~22 ms a file, where the same 525 decrypts twelve at a time take
+# ~1 s (the gantry isogram spawn: 17.6 s of setup against ~1 s for every
+# other repo, 2026-09-19). git never parallelises a smudge filter itself —
+# long-running filters are even excluded from its parallel checkout — so the
+# parallelism has to come from the filter. Under the long-running protocol
+# one glassine process serves every file of a git command, and with the
+# `delay` capability a checkout hands it every envelope first and collects
+# the plaintexts afterwards, so the decrypts run in the background,
+# GLASSINE_JOBS (default: the core count) at a time, while git carries on.
+#
+# Protocol (git help gitattributes, "Long Running Filter Process"; git ≥ 2.11,
+# `delay` since 2.16 — older git ignores filter.<driver>.process and keeps
+# the %f filters init still configures): pkt-line framing — a 4-hex-digit
+# length that counts itself, at most 65516 payload bytes, `0000` a flush;
+# a git-filter-client/version=2 greeting, a capability exchange, then per
+# file `command=`/`pathname=` headers and the content, answered by a status
+# list, the content and a closing status list. Every byte from git is read
+# with bash's own `read` builtin: it is the one reader that never takes more
+# from a pipe than asked (BSD `head -c` and busybox's sit on stdio and
+# swallow whatever follows into a buffer that dies with them), and since
+# `read -d ''` stops on a NUL it then consumes, pkt_read_payload puts the
+# NUL back and carries on — arbitrary plaintext survives clean intact.
+#
+# Both directions delegate to cmd_clean and cmd_smudge over files, never
+# variables, so the process behaves exactly as the %f form does — an
+# envelope no local key opens still passes through as ciphertext — and
+# filter.glassine.required keeps its meaning: a clean that dies answers
+# status=error and git aborts the operation instead of staging plaintext.
+
+readonly PKT_MAX_PAYLOAD=65516
+
+pkt_line() { # <text> — one packet carrying <text> plus a newline
+  printf '%04x%s\n' $((${#1} + 5)) "$1"
+}
+
+pkt_flush() {
+  printf '0000'
+}
+
+# Copy exactly <bytes> from stdin to stdout, with the read builtin alone.
+pkt_read_payload() { # <bytes>
+  local n=$1 chunk
+  while [ "$n" -gt 0 ]; do
+    chunk=''
+    if IFS= read -r -d '' -n "$n" chunk; then
+      printf '%s' "$chunk"
+      n=$((n - ${#chunk}))
+      if [ "$n" -gt 0 ]; then # read stopped at a NUL, which it consumed
+        printf '\0'
+        n=$((n - 1))
+      fi
+    else
+      printf '%s' "$chunk"
+      return 1
+    fi
+  done
+}
+
+# Read one text packet into PKT (trailing newline stripped). Returns 1 on a
+# flush packet and 2 when git closed the stream.
+pkt_read_line() {
+  local len
+  PKT=''
+  IFS= read -r -n 4 len || return 2
+  [ "${#len}" -eq 4 ] || return 2
+  len=$((16#$len))
+  [ "$len" -ne 0 ] || return 1
+  len=$((len - 4))
+  [ "$len" -gt 0 ] || return 2
+  IFS= read -r -d '' -n "$len" PKT || return 2
+  PKT=${PKT%$'\n'}
+}
+
+# The next header packet of a request into PKT; false at the flush that ends
+# the list. Git closing the stream mid-request is a protocol fault.
+pkt_next() {
+  pkt_read_line && return 0
+  [ $? -eq 1 ] || die 'filter-process: git closed the stream mid-request'
+  return 1
+}
+
+# Content packets up to their flush, written to <file>.
+pkt_read_content() { # <file>
+  local len
+  : >"$1"
+  while :; do
+    IFS= read -r -n 4 len || return 1
+    [ "${#len}" -eq 4 ] || return 1
+    len=$((16#$len))
+    [ "$len" -ne 0 ] || return 0
+    pkt_read_payload $((len - 4)) >>"$1" || return 1
+  done
+}
+
+# <file> framed as content packets (no trailing flush). A single packet is
+# the common case; larger files go out one dd block per packet.
+pkt_write_file() { # <file>
+  local size chunk skip=0
+  size=$(($(wc -c <"$1")))
+  if [ "$size" -le "$PKT_MAX_PAYLOAD" ]; then
+    if [ "$size" -gt 0 ]; then
+      printf '%04x' $((size + 4))
+      cat "$1"
+    fi
+    return 0
+  fi
+  while [ "$size" -gt 0 ]; do
+    chunk=$size
+    [ "$chunk" -le "$PKT_MAX_PAYLOAD" ] || chunk=$PKT_MAX_PAYLOAD
+    printf '%04x' $((chunk + 4))
+    dd if="$1" bs="$PKT_MAX_PAYLOAD" skip="$skip" count=1 2>/dev/null
+    size=$((size - chunk))
+    skip=$((skip + 1))
+  done
+}
+
+filter_send_file() { # <file>
+  pkt_line 'status=success'
+  pkt_flush
+  pkt_write_file "$1"
+  pkt_flush
+  pkt_flush
+}
+
+filter_send_error() {
+  pkt_line 'status=error'
+  pkt_flush
+}
+
+# Decrypts as wide as the machine allows unless told otherwise.
+filter_jobs() {
+  local jobs=${GLASSINE_JOBS:-}
+  case $jobs in
+  '' | *[!0-9]*) jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4) ;;
+  esac
+  [ "$jobs" -ge 1 ] 2>/dev/null || jobs=4
+  printf '%s' "$jobs"
+}
+
+# The background decrypt pool: an xargs fed request numbers over a fifo, one
+# `glassine filter-worker` per envelope. Workers report through a second
+# fifo we hold open read-write, so waiting for a plaintext is a blocking
+# read, not a poll. One git command can check out more than once (a rebase
+# replays every commit), so a pool starts per delayed round: the fifos are
+# made once and the previous round's xargs is reaped first.
+filter_start_pool() {
+  filter_wait_pool
+  [ -p "$FILTER_DIR/jobs" ] || mkfifo "$FILTER_DIR/jobs"
+  if [ ! -p "$FILTER_DIR/ready.fifo" ]; then
+    mkfifo "$FILTER_DIR/ready.fifo"
+    exec 4<>"$FILTER_DIR/ready.fifo"
+  fi
+  xargs -0 -P "$(filter_jobs)" -n 1 glassine filter-worker "$FILTER_DIR" <"$FILTER_DIR/jobs" >&2 &
+  FILTER_POOL_PID=$!
+  exec 3>"$FILTER_DIR/jobs"
+  FILTER_FEEDING=1
+}
+
+filter_stop_feeding() {
+  [ "$FILTER_FEEDING" -eq 1 ] || return 0
+  exec 3>&-
+  FILTER_FEEDING=0
+}
+
+filter_wait_pool() {
+  filter_stop_feeding
+  [ -z "$FILTER_POOL_PID" ] || wait "$FILTER_POOL_PID" || true
+  FILTER_POOL_PID=''
+}
+
+# One delayed smudge: park the envelope under a request number, hand the
+# number to the pool, tell git to ask again later.
+filter_delay_smudge() { # <pathname>
+  [ "$FILTER_FEEDING" -eq 1 ] || filter_start_pool
+  FILTER_N=$((FILTER_N + 1))
+  mv "$FILTER_DIR/req.in" "$FILTER_DIR/$FILTER_N.in"
+  printf '%s\0' "$1" >"$FILTER_DIR/$FILTER_N.path"
+  FILTER_PATH[FILTER_N]=$1
+  FILTER_OUTSTANDING=$((FILTER_OUTSTANDING + 1))
+  printf '%s\0' "$FILTER_N" >&3
+  pkt_line 'status=delayed'
+  pkt_flush
+}
+
+# git asks for delayed paths that are ready; block until at least one is,
+# answer with an empty list when nothing is left (or nothing more can come:
+# a dead pool leaves the rest for git to report as missing).
+filter_list_available() {
+  filter_stop_feeding # git has finished its pass; no more envelopes arrive
+  local n listed=0 alive=1
+  while [ "$FILTER_OUTSTANDING" -gt 0 ] && [ "$listed" -eq 0 ] && [ "$alive" -eq 1 ]; do
+    for n in "${!FILTER_PATH[@]}"; do
+      [ -z "${FILTER_LISTED[n]:-}" ] || continue
+      if [ -f "$FILTER_DIR/ready/$n" ] || [ -f "$FILTER_DIR/ready/$n.error" ]; then
+        pkt_line "pathname=${FILTER_PATH[n]}"
+        FILTER_LISTED[n]=1
+        listed=$((listed + 1))
+      fi
+    done
+    [ "$listed" -eq 0 ] || break
+    if ! IFS= read -r -d '' -t 1 -u 4 n; then
+      kill -0 "$FILTER_POOL_PID" 2>/dev/null || alive=0
+    fi
+  done
+  [ "$alive" -eq 1 ] || [ "$listed" -gt 0 ] ||
+    warn "filter-process: the decrypt pool died with $FILTER_OUTSTANDING envelope(s) pending"
+  pkt_flush
+  pkt_line 'status=success'
+  pkt_flush
+}
+
+# A delayed path git has come back for: serve its framed plaintext.
+filter_serve_ready() { # <n>
+  local n=$1
+  if [ -f "$FILTER_DIR/ready/$n" ]; then
+    pkt_line 'status=success'
+    pkt_flush
+    cat "$FILTER_DIR/ready/$n"
+    pkt_flush
+    pkt_flush
+  else
+    filter_send_error
+  fi
+  unset "FILTER_PATH[$n]" "FILTER_LISTED[$n]"
+  FILTER_OUTSTANDING=$((FILTER_OUTSTANDING - 1))
+}
+
+filter_smudge() { # <pathname> <can-delay>
+  local pathname=$1 n
+  if [ "$2" -eq 1 ] && [ "$FILTER_DELAY" -eq 1 ]; then
+    filter_delay_smudge "$pathname"
+    return 0
+  fi
+  for n in "${!FILTER_PATH[@]}"; do
+    if [ -n "${FILTER_LISTED[n]:-}" ] && [ "${FILTER_PATH[n]}" = "$pathname" ]; then
+      filter_serve_ready "$n"
+      return 0
+    fi
+  done
+  set +e
+  (
+    set -e
+    cmd_smudge "$pathname" <"$FILTER_DIR/req.in" >"$FILTER_DIR/req.out"
+  )
+  local rc=$?
+  set -e
+  if [ "$rc" -eq 0 ]; then
+    filter_send_file "$FILTER_DIR/req.out"
+  else
+    filter_send_error
+  fi
+}
+
+# cmd_clean runs as a plain statement in its own shell so `set -e` — and
+# die's exit — end that shell alone; inside an if or || it would be switched
+# off for the whole body and a failed step could stage a partial envelope.
+filter_clean() { # <pathname>
+  set +e
+  (
+    set -e
+    cmd_clean "$1" <"$FILTER_DIR/req.in" >"$FILTER_DIR/req.out"
+  )
+  local rc=$?
+  set -e
+  if [ "$rc" -eq 0 ]; then
+    filter_send_file "$FILTER_DIR/req.out"
+  else
+    filter_send_error
+  fi
+}
+
+cmd_filter_process() {
+  ensure_tmpdir
+  export LC_ALL=C # `read -n` and ${#var} count bytes
+  FILTER_DIR="$GLASSINE_TMPDIR/filter"
+  FILTER_N=0 FILTER_OUTSTANDING=0 FILTER_FEEDING=0 FILTER_POOL_PID='' FILTER_DELAY=0
+  FILTER_PATH=() FILTER_LISTED=()
+  mkdir -p "$FILTER_DIR/ready"
+  local PKT rc command pathname can_delay
+  local offer_clean=0 offer_smudge=0 offer_delay=0
+
+  pkt_read_line || die 'filter-process: expected the git-filter-client greeting'
+  [ "$PKT" = 'git-filter-client' ] || die "filter-process: unexpected greeting '$PKT'"
+  local versioned=0
+  while pkt_next; do
+    [ "$PKT" != 'version=2' ] || versioned=1
+  done
+  [ "$versioned" -eq 1 ] || die 'filter-process: git offered no version 2 of the filter protocol'
+  pkt_line 'git-filter-server'
+  pkt_line 'version=2'
+  pkt_flush
+
+  while pkt_next; do
+    case $PKT in
+    capability=clean) offer_clean=1 ;;
+    capability=smudge) offer_smudge=1 ;;
+    capability=delay) offer_delay=1 ;;
+    esac
+  done
+  [ "$offer_clean" -eq 0 ] || pkt_line 'capability=clean'
+  [ "$offer_smudge" -eq 0 ] || pkt_line 'capability=smudge'
+  if [ "$offer_smudge" -eq 1 ] && [ "$offer_delay" -eq 1 ]; then
+    pkt_line 'capability=delay'
+    FILTER_DELAY=1
+  fi
+  pkt_flush
+
+  while :; do
+    pkt_read_line && rc=0 || rc=$?
+    [ "$rc" -ne 2 ] || break # git is done with us
+    [ "$rc" -ne 1 ] || die 'filter-process: request without headers'
+    command='' pathname='' can_delay=0
+    while :; do
+      case $PKT in
+      command=*) command=${PKT#command=} ;;
+      pathname=*) pathname=${PKT#pathname=} ;;
+      can-delay=1) can_delay=1 ;;
+      esac
+      pkt_next || break
+    done
+    case $command in
+    list_available_blobs) filter_list_available ;;
+    clean | smudge)
+      pkt_read_content "$FILTER_DIR/req.in" || die 'filter-process: git closed the stream mid-content'
+      if [ "$command" = clean ]; then
+        filter_clean "$pathname"
+      else
+        filter_smudge "$pathname" "$can_delay"
+      fi
+      ;;
+    *) die "filter-process: unknown command '$command'" ;;
+    esac
+  done
+  filter_wait_pool
+}
+
+# One pool job: the parked envelope through cmd_smudge, framed ready to
+# serve, published by an atomic rename and a nudge on the ready fifo. Any
+# fault lands an .error marker so git gets status=error for that path,
+# never silence.
+cmd_filter_worker() { # <dir> <n>
+  local dir=$1 n=$2 path=''
+  IFS= read -r -d '' path <"$dir/$n.path" || true
+  set +e
+  (
+    set -e
+    cmd_smudge "$path" <"$dir/$n.in" >"$dir/$n.out"
+    pkt_write_file "$dir/$n.out" >"$dir/$n.pkt"
+    mv "$dir/$n.pkt" "$dir/ready/$n"
+  )
+  local rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || : >"$dir/ready/$n.error"
+  printf '%s\0' "$n" >>"$dir/ready.fifo"
 }
 
 # ---------------------------------------------------------------------------
@@ -776,6 +1140,9 @@ cmd_init() {
 
   git config filter.glassine.clean 'glassine clean %f'
   git config filter.glassine.smudge 'glassine smudge %f'
+  # One process per git command, decrypting a checkout in parallel (see the
+  # filter process section); git < 2.11 ignores it and runs the two above.
+  git config filter.glassine.process 'glassine filter-process'
   # A failing clean must abort the operation; without this git would silently
   # stage plaintext when the filter errors.
   git config filter.glassine.required true
@@ -1064,6 +1431,8 @@ main() {
   smudge) cmd_smudge "$@" ;;
   textconv) cmd_textconv "$@" ;;
   merge) cmd_merge "$@" ;;
+  filter-process) cmd_filter_process "$@" ;;
+  filter-worker) cmd_filter_worker "$@" ;;
   init) cmd_init "$@" ;;
   protect) cmd_protect "$@" ;;
   allow) cmd_allow "$@" ;;
