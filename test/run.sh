@@ -1027,4 +1027,95 @@ git_q clone "$MIXED" "$WORK/clone-mixed"
 )
 ok 'init refreshes exactly the envelopes a scanned key opens; the rest are listed'
 
+# --- 45: smudge cache — a hit is served from the cache, byte for byte, without sops
+# init pre-decrypts the openable envelopes in parallel and hands the checkout
+# the cache in GLASSINE_SMUDGE_CACHE; the smudge serves an entry only when the
+# envelope on stdin is byte-identical to the one cached. The cached plaintext
+# is a sentinel the real envelope does NOT decrypt to, so output proves its
+# source; the sops shim proves the hit cost no decrypt.
+
+CACHE="$WORK/smudge-cache"
+mkdir -p "$CACHE/envelope/secrets" "$CACHE/plain/secrets" "$CACHE/stdin/secrets"
+git -C "$ORIGIN" cat-file blob :secrets/creds.yaml >"$WORK/envelope.bin"
+cp "$WORK/envelope.bin" "$CACHE/envelope/secrets/creds.yaml"
+printf 'served: from-cache\n' >"$CACHE/plain/secrets/creds.yaml"
+: >"$WORK/sopscalls"
+(
+  cd "$ORIGIN"
+  GLASSINE_SMUDGE_CACHE=$CACHE PATH="$WORK/sopsshim:$PATH" as_host hosta \
+    glassine smudge secrets/creds.yaml <"$WORK/envelope.bin"
+) >"$WORK/smudged"
+cmp -s "$WORK/smudged" "$CACHE/plain/secrets/creds.yaml" ||
+  fail 'a cache hit did not serve the cached plaintext byte for byte'
+[ ! -s "$WORK/sopscalls" ] ||
+  fail 'a cache hit still called sops'
+ok 'smudge serves a proven cache hit byte for byte without calling sops'
+
+# --- 46: smudge cache — a miss falls back to decrypting, exactly as without a cache
+# The cached envelope differs from stdin by one byte (a stale or corrupt
+# entry): the sentinel must never be served; the real plaintext must come
+# back, through sops. Then an entry with no plaintext half, and no cache at all.
+
+printf 'x' >>"$CACHE/envelope/secrets/creds.yaml"
+: >"$WORK/sopscalls"
+(
+  cd "$ORIGIN"
+  GLASSINE_SMUDGE_CACHE=$CACHE PATH="$WORK/sopsshim:$PATH" as_host hosta \
+    glassine smudge secrets/creds.yaml <"$WORK/envelope.bin"
+) >"$WORK/smudged"
+cmp -s "$WORK/smudged" "$ORIGIN/secrets/creds.yaml" ||
+  fail 'a cache miss did not decrypt to the real plaintext'
+[ -s "$WORK/sopscalls" ] ||
+  fail 'a cache miss did not reach sops'
+rm "$CACHE/plain/secrets/creds.yaml"
+cp "$WORK/envelope.bin" "$CACHE/envelope/secrets/creds.yaml"
+(
+  cd "$ORIGIN"
+  GLASSINE_SMUDGE_CACHE=$CACHE as_host hosta glassine smudge secrets/creds.yaml <"$WORK/envelope.bin"
+) >"$WORK/smudged"
+cmp -s "$WORK/smudged" "$ORIGIN/secrets/creds.yaml" ||
+  fail 'an entry without its plaintext half was not treated as a miss'
+(
+  cd "$ORIGIN"
+  GLASSINE_SMUDGE_CACHE="$WORK/no-such-cache" as_host hosta glassine smudge secrets/creds.yaml <"$WORK/envelope.bin"
+) >"$WORK/smudged"
+cmp -s "$WORK/smudged" "$ORIGIN/secrets/creds.yaml" ||
+  fail 'a missing cache directory was not treated as a miss'
+ok 'smudge treats a corrupt, half-written or absent cache entry as a miss and decrypts'
+
+# --- 47: init decrypts every openable envelope in the prefetch, none in the smudge --
+# A second shim also records which glassine command spawned each sops call:
+# after init, every envelope is plaintext, the index agrees, and no decrypt
+# was spawned by a smudge — the checkout served every file from the cache.
+# GLASSINE_JOBS=2 exercises the parallel path with more than one worker.
+
+mkdir -p "$WORK/sopsshim2"
+cat >"$WORK/sopsshim2/sops" <<EOF
+#!/usr/bin/env bash
+printf '%s :: %s\n' "\$(ps -o args= -p \$PPID)" "\$*" >>"$WORK/sopscalls"
+exec "$REAL_SOPS" "\$@"
+EOF
+chmod +x "$WORK/sopsshim2/sops"
+git_q clone "$ORIGIN" "$WORK/clone-prefetch"
+(
+  cd "$WORK/clone-prefetch"
+  git config user.name test && git config user.email test@example.invalid
+  : >"$WORK/sopscalls"
+  INIT_OUT=$(GLASSINE_JOBS=2 PATH="$WORK/sopsshim2:$PATH" as_host hosta glassine init 2>&1) ||
+    fail "init failed on the prefetch clone: $INIT_OUT"
+  case "$INIT_OUT" in
+  *'decrypted 1 file(s)'*) : ;;
+  *) fail "init miscounted the prefetched refresh: $INIT_OUT" ;;
+  esac
+  cmp -s secrets/creds.yaml "$ORIGIN/secrets/creds.yaml" ||
+    fail 'the prefetched checkout did not land the plaintext byte for byte'
+  [ -z "$(as_host hosta git status --porcelain)" ] ||
+    fail 'the prefetched checkout left the worktree dirty'
+  grep -q ' prefetch ' "$WORK/sopscalls" ||
+    fail "init did not decrypt through the prefetch: $(cat "$WORK/sopscalls")"
+  ! grep -q ' smudge ' "$WORK/sopscalls" ||
+    fail "a smudge still called sops after the prefetch: $(cat "$WORK/sopscalls")"
+)
+ok 'init pre-decrypts in parallel and the checkout serves every file from the cache'
+
 printf '\nall %d tests passed\n' "$PASS"

@@ -10,7 +10,33 @@
 # https://github.com/DJRHails/glassine
 set -euo pipefail
 
-readonly VERSION='0.7.2'
+readonly VERSION='0.7.3'
+
+# smudge fast path: serve an init-time cache hit before bash spends ~6 ms
+# parsing the rest of this file. cmd_init pre-decrypts the openable
+# envelopes in parallel (cmd_prefetch) and exports GLASSINE_SMUDGE_CACHE for
+# its one checkout; git then runs `glassine smudge %f` once per file,
+# serially, so every millisecond spent here is paid 525 times on the isogram
+# clone (the whole smudge ran ~22 ms a file, ~12 of them a sops start-up the
+# prefetch has already paid: 13.5 s of init). A hit is proven from the bytes
+# git hands us — stdin must equal the envelope the prefetch decrypted, byte
+# for byte — never from the path alone; anything short of that falls through
+# to the ordinary smudge with stdin restored, exactly today's path. The three
+# subtrees (envelope/ plain/ stdin/) keep a repo path from ever colliding
+# with a cache sibling.
+if [ -n "${GLASSINE_SMUDGE_CACHE:-}" ] && [ "${1:-}" = smudge ] && [ -n "${2:-}" ] &&
+  [ -f "$GLASSINE_SMUDGE_CACHE/envelope/$2" ] && [ -f "$GLASSINE_SMUDGE_CACHE/plain/$2" ]; then
+  _smudge_in="$GLASSINE_SMUDGE_CACHE/stdin/$2"
+  # The prefetch created stdin/'s directory tree alongside the entry; a
+  # missing parent is a fault, and a fault is a miss.
+  if [ -d "${_smudge_in%/*}" ]; then
+    cat >"$_smudge_in"
+    if cmp -s "$_smudge_in" "$GLASSINE_SMUDGE_CACHE/envelope/$2"; then
+      exec cat "$GLASSINE_SMUDGE_CACHE/plain/$2"
+    fi
+    exec <"$_smudge_in"
+  fi
+fi
 
 GLASSINE_TMPDIR=''
 
@@ -267,6 +293,46 @@ cmd_smudge() { # <repo-relative-path>
   else
     cat "$work"
   fi
+}
+
+# prefetch: decrypt worktree envelopes into the smudge cache cmd_init exports
+# for its checkout (the fast path at the top of this file reads it). One
+# worker per xargs batch, many batches at once. An entry lands plaintext
+# first, atomically (a rename out of tmp/), the envelope copy last: the fast
+# path serves nothing without both, so a worker that dies mid-write leaves a
+# miss, never a half-served file. A failed decrypt leaves nothing and the
+# smudge pays the full sops call for that file, as it does today.
+cmd_prefetch() { # <cache> <root> <file>...
+  local cache=$1 root=$2 f path dir tmp plain
+  shift 2
+  for f in "$@"; do
+    path=${f#"$root/"}
+    case $path in
+    */*) dir=${path%/*}/ ;;
+    *) dir='' ;;
+    esac
+    mkdir -p "$cache/tmp/$dir" "$cache/plain/$dir" "$cache/envelope/$dir" "$cache/stdin/$dir"
+    tmp="$cache/tmp/$path" plain="$cache/plain/$path"
+    if decrypt_to "$f" "$tmp" "$path" && mv -f -- "$tmp" "$plain"; then
+      cp -- "$f" "$cache/envelope/$path" || rm -f -- "$plain"
+    else
+      rm -f -- "$tmp"
+    fi
+  done
+}
+
+# Parallelism for the pre-decrypt: GLASSINE_JOBS when it names a count, else
+# the online core count (getconf answers on Linux and macOS alike; nproc is
+# GNU-only), else 4. 525 envelopes decrypt in ~1 s at 12 jobs vs ~9 s at 1.
+prefetch_jobs() {
+  local jobs=${GLASSINE_JOBS:-}
+  case $jobs in
+  '' | *[!0-9]* | 0) jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true) ;;
+  esac
+  case $jobs in
+  '' | *[!0-9]* | 0) jobs=4 ;;
+  esac
+  printf '%s\n' "$jobs"
 }
 
 # textconv: decrypt a blob for diff display. git hands us a bare temporary
@@ -824,6 +890,19 @@ cmd_init() {
   # worker checkout, [perf-bestofn] 2026-09-07). partition_openable decides
   # that up front from the recipient material the envelopes carry; the ones
   # it leaves out are reported exactly as a failed refresh would report them.
+  #
+  # What is left is still serial: git runs the smudge filter once per file,
+  # one after another, and each one is ~22 ms, ~12 of them a sops start-up
+  # (13.5 s for the 525 envelopes of the isogram clone, ~17.6 s p50 in every
+  # gantry spawn attached to it, 2026-09-19). So the openable envelopes are
+  # decrypted up front, in parallel (cmd_prefetch under xargs -P, ~1 s at 12
+  # jobs), into a cache under the run's tmpdir — gone with the init — and the
+  # checkout is handed its location in GLASSINE_SMUDGE_CACHE, which git passes
+  # through to every filter it spawns. The smudge serves a hit without sops
+  # only when the envelope git feeds it is byte-identical to the one the
+  # prefetch decrypted (the fast path at the top of this file); a miss or a
+  # failed prefetch is today's smudge. The prefetch reads the worktree copies,
+  # so it runs before they are deleted.
   ensure_tmpdir
   local f refreshed=0 opaque=''
   local stale="$GLASSINE_TMPDIR/stale" pathspecs="$GLASSINE_TMPDIR/stale_pathspecs"
@@ -843,8 +922,12 @@ cmd_init() {
     opaque="$opaque ${f#"$root/"}"
   done <"$unopenable"
   if [ -s "$stale" ]; then
+    local cache="$GLASSINE_TMPDIR/smudge-cache"
+    mkdir -p "$cache"
+    xargs -0 -n 8 -P "$(prefetch_jobs)" glassine prefetch "$cache" "$root" <"$stale" ||
+      warn 'pre-decrypting in parallel failed; the checkout decrypts one file at a time'
     xargs -0 rm -f -- <"$stale"
-    git checkout --pathspec-from-file="$pathspecs" --pathspec-file-nul --
+    GLASSINE_SMUDGE_CACHE=$cache git checkout --pathspec-from-file="$pathspecs" --pathspec-file-nul --
     # The smudge filter passes ciphertext through when no identity matches
     # the envelope's recipients, so re-check before claiming success.
     while IFS= read -r -d '' f; do
@@ -1045,8 +1128,11 @@ CONFIG
                  matching the envelope's recipients and pins the winner here.
                  An explicit SOPS_AGE_SSH_PRIVATE_KEY_FILE wins.
 
-INTERNAL (invoked by git)
-  clean / smudge / textconv / merge
+INTERNAL (invoked by git, or by init)
+  clean / smudge / textconv / merge / prefetch
+
+ENVIRONMENT
+  GLASSINE_JOBS  parallelism of init's pre-decrypt (default: the core count)
 
 QUICKSTART (per repository)
   glassine init
@@ -1062,6 +1148,7 @@ main() {
   case "$cmd" in
   clean) cmd_clean "$@" ;;
   smudge) cmd_smudge "$@" ;;
+  prefetch) cmd_prefetch "$@" ;;
   textconv) cmd_textconv "$@" ;;
   merge) cmd_merge "$@" ;;
   init) cmd_init "$@" ;;
