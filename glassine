@@ -10,7 +10,7 @@
 # https://github.com/DJRHails/glassine
 set -euo pipefail
 
-readonly VERSION='0.7.2'
+readonly VERSION='0.8.0'
 
 GLASSINE_TMPDIR=''
 
@@ -54,8 +54,19 @@ ensure_tmpdir() {
 #   dotenv: sops_mac=ENC[AES256_GCM,...  ini:  mac = ENC[AES256_GCM,...
 # Matching on that is key-independent, so keyless hosts can recognise
 # ciphertext too. (-a treats binary content as text.)
+readonly ENVELOPE_MARK='mac[^[:alnum:]]{1,4}ENC\[AES256_GCM'
 is_envelope() {
-  LC_ALL=C grep -aqE 'mac[^[:alnum:]]{1,4}ENC\[AES256_GCM' "$1"
+  LC_ALL=C grep -aqE "$ENVELOPE_MARK" "$1"
+}
+
+# The envelopes among a NUL-separated file list, NUL-separated on stdout:
+# is_envelope over the whole list in one grep rather than one per file. init
+# judges every managed file twice (which are ciphertext, then which still
+# are); at 525 files a fork-per-file loop cost ~0.6 s each way where the
+# batch costs ~10 ms. grep exits 1 when nothing matches — not a fault.
+envelopes_among() { # <list>
+  [ -s "$1" ] || return 0
+  LC_ALL=C xargs -0 grep -laE --null "$ENVELOPE_MARK" -- <"$1" || true
 }
 
 # True when <file> looks binary by git's own heuristic — a NUL byte in the
@@ -767,6 +778,80 @@ cmd_protect() { # <glob>...
   fi
 }
 
+# One stale envelope of init's refresh, run under `xargs -P` (internal). The
+# staged blob — the source of truth today's delete-and-checkout re-smudges
+# from — is decrypted into the cache entry for the path, then installed over
+# the worktree copy atomically (a temp file beside it carrying its mode, then
+# mv). The entry's `refreshed` marker tells init the write landed; an
+# `unopenable` marker says the key could not open an envelope that IS the
+# staged blob, so a re-smudge would only pass the same ciphertext through —
+# skipping it is what the checkout would have produced. Anything else (no
+# staged blob, a worktree envelope that differs from the index, a failed
+# write) leaves no marker and init hands the file to the checkout unchanged.
+# Never fails: a fault here is a fallback, not an abort.
+cmd_refresh_envelope() { # <root> <cache> <file>
+  local root=$1 cache=$2 file=$3 path=${3#"$1/"}
+  local entry="$cache/$path" tmp
+  mkdir -p -- "$entry" || return 0
+  if ! git cat-file blob ":$path" >"$entry/envelope" 2>/dev/null; then
+    rm -rf -- "$entry"
+    return 0
+  fi
+  if ! is_envelope "$entry/envelope" || ! decrypt_to "$entry/envelope" "$entry/plain" "$path"; then
+    rm -f -- "$entry/plain"
+    cmp -s "$entry/envelope" "$file" 2>/dev/null && : >"$entry/unopenable"
+    return 0
+  fi
+  tmp=$(mktemp "${file%/*}/.glassine-refresh.XXXXXX") || return 0
+  if cp -p -- "$file" "$tmp" && cat -- "$entry/plain" >"$tmp" && mv -f -- "$tmp" "$file"; then
+    : >"$entry/refreshed"
+  else
+    rm -f -- "$tmp"
+  fi
+}
+
+# The clean filter init's index reconcile runs, written beside the cache
+# (never inside it: the cache's tree is keyed by repo paths, so a managed
+# file named like the helper would collide with it) and wired for that ONE
+# git call via `-c` — the repository's own filter config is never touched,
+# so the cache can influence nothing but init's refresh.
+# POSIX sh rather than glassine itself because the reconcile invokes it once
+# per rewritten file, serially: bash starting and parsing this script is
+# ~6 ms of the ~9 ms a `glassine clean` fast path cost per file (525 files:
+# ~4.7 s), sh on the same job ~1 ms. The hit is proven from bytes, never the
+# path: the incoming plaintext must equal the plaintext the worker decrypted
+# for this path, and only then is that worker's copy of the staged envelope
+# handed back — a stale or corrupted plaintext entry, or a path with no
+# entry, runs the ordinary clean on the same input. A wrong envelope cannot
+# get past the reconcile either: --refresh writes no blob, it only accepts
+# stat for content that hashes to what is already staged.
+write_refresh_clean() { # <file>
+  cat >"$1" <<'EOF'
+# glassine init's reconcile clean (see write_refresh_clean). Sourced by the
+# sh git spawns per file, with the repo-relative path (git's %f) in $p.
+set -eu
+entry="$GLASSINE_REFRESH_CACHE/$p"
+[ -f "$entry/plain" ] || exec glassine clean "$p"
+cat >"$entry/incoming"
+if cmp -s "$entry/incoming" "$entry/plain"; then
+  exec cat -- "$entry/envelope"
+fi
+exec glassine clean "$p" <"$entry/incoming"
+EOF
+}
+
+# Parallelism for init's refresh: one decrypt per core unless GLASSINE_JOBS
+# says otherwise. getconf answers on both Linux and macOS (nproc does not
+# exist on macOS, sysctl not on Linux); anything unusable means 4.
+refresh_jobs() {
+  local jobs=${GLASSINE_JOBS:-}
+  [ -n "$jobs" ] || jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+  case "$jobs" in
+  '' | *[!0-9]* | 0) jobs=4 ;;
+  esac
+  printf '%s' "$jobs"
+}
+
 cmd_init() {
   local root
   root=$(git rev-parse --show-toplevel 2>/dev/null) || die 'not inside a git repository'
@@ -824,36 +909,87 @@ cmd_init() {
   # worker checkout, [perf-bestofn] 2026-09-07). partition_openable decides
   # that up front from the recipient material the envelopes carry; the ones
   # it leaves out are reported exactly as a failed refresh would report them.
+  #
+  # The openable ones are decrypted in place, in parallel, and the index is
+  # reconciled afterwards — not re-smudged through the checkout. git runs a
+  # smudge filter once per file, serially, so the one checkout still paid
+  # ~22 ms × 525 (a 13 ms sops call plus bash parsing this script) ≈ 13.5 s
+  # on the isogram clone, every gantry spawn (2026-09-19). Each envelope's
+  # staged blob is decrypted by cmd_refresh_envelope under `xargs -P` and
+  # written straight over the worktree copy; the index then disagrees on
+  # stat alone and is reconciled in two git calls. `update-index --refresh`
+  # by itself would NOT do: a file whose size moved against a non-zero index
+  # stat is declared modified without a content check (ie_modified's
+  # DATA_CHANGED short-circuit), and the plaintext never has the envelope's
+  # size — so the entries are first re-stuffed with their own mode and blob
+  # through `--index-info`, which zeroes the stat, and the refresh then does
+  # go to the filesystem, running clean per rewritten file. That clean is
+  # write_refresh_clean's, answering from the cache the workers left
+  # (plaintext + staged envelope per path, proven by byte compare) without a
+  # sops call. The cache lives in GLASSINE_TMPDIR and dies with init. Any
+  # envelope a worker could not land takes the delete-and-checkout route
+  # exactly as before.
   ensure_tmpdir
-  local f refreshed=0 opaque=''
+  local f refreshed=0 opaque='' entry
   local stale="$GLASSINE_TMPDIR/stale" pathspecs="$GLASSINE_TMPDIR/stale_pathspecs"
   local envelopes="$GLASSINE_TMPDIR/stale_envelopes" unopenable="$GLASSINE_TMPDIR/stale_unopenable"
-  : >"$envelopes"
+  local cache="$GLASSINE_TMPDIR/refresh" fallback="$GLASSINE_TMPDIR/stale_fallback"
+  local helper="$GLASSINE_TMPDIR/refresh_clean.sh"
+  local rewritten="$GLASSINE_TMPDIR/stale_rewritten" rewritten_n=0
+  local present="$GLASSINE_TMPDIR/managed_present" still="$GLASSINE_TMPDIR/stale_still"
+  : >"$present"
   while IFS= read -r -d '' f; do
-    if [ -f "$root/$f" ] && is_envelope "$root/$f"; then
-      printf '%s\0' "$root/$f" >>"$envelopes"
-    fi
+    [ ! -f "$root/$f" ] || printf '%s\0' "$root/$f" >>"$present"
   done < <(managed_files)
+  envelopes_among "$present" >"$envelopes"
   partition_openable "$envelopes" "$stale" "$unopenable"
-  : >"$pathspecs"
-  while IFS= read -r -d '' f; do
-    printf ':(literal)%s\0' "${f#"$root/"}" >>"$pathspecs"
-  done <"$stale"
   while IFS= read -r -d '' f; do
     opaque="$opaque ${f#"$root/"}"
   done <"$unopenable"
   if [ -s "$stale" ]; then
-    xargs -0 rm -f -- <"$stale"
-    git checkout --pathspec-from-file="$pathspecs" --pathspec-file-nul --
-    # The smudge filter passes ciphertext through when no identity matches
-    # the envelope's recipients, so re-check before claiming success.
+    mkdir -p -- "$cache"
+    xargs -0 -n 1 -P "$(refresh_jobs)" glassine refresh-envelope "$root" "$cache" <"$stale" || true
+    : >"$pathspecs"
+    : >"$fallback"
+    : >"$rewritten"
     while IFS= read -r -d '' f; do
-      if is_envelope "$f"; then
-        opaque="$opaque ${f#"$root/"}"
-      else
-        refreshed=$((refreshed + 1))
+      entry="$cache/${f#"$root/"}"
+      if [ -f "$entry/refreshed" ]; then
+        printf ':(literal)%s\0' "${f#"$root/"}" >>"$rewritten"
+        rewritten_n=$((rewritten_n + 1))
+      elif [ ! -f "$entry/unopenable" ]; then
+        printf ':(literal)%s\0' "${f#"$root/"}" >>"$pathspecs"
+        printf '%s\0' "$f" >>"$fallback"
       fi
     done <"$stale"
+    if [ "$rewritten_n" -gt 0 ]; then
+      # ls-files --stage output is one of --index-info's accepted formats.
+      # -q and --unmerged must precede --refresh (it acts as soon as it is
+      # parsed): -q keeps an unrelated locally-modified file from failing the
+      # reconcile, --unmerged an unrelated conflicted one (init mid-merge).
+      xargs -0 git -C "$root" ls-files -sz --full-name -- <"$rewritten" |
+        git -C "$root" update-index -z --index-info
+      write_refresh_clean "$helper"
+      # git hands the command to `sh -c` with %f already single-quoted, so
+      # the helper is sourced with the path in $p rather than exec'd as a
+      # second sh: one process fewer per rewritten file. The value is
+      # deliberately literal — the sh git spawns expands it.
+      # shellcheck disable=SC2016
+      GLASSINE_REFRESH_CACHE=$cache GLASSINE_REFRESH_CLEAN=$helper git -C "$root" \
+        -c 'filter.glassine.clean=p=%f; . "$GLASSINE_REFRESH_CLEAN"' update-index -q --unmerged --refresh
+    fi
+    if [ -s "$fallback" ]; then
+      xargs -0 rm -f -- <"$fallback"
+      git checkout --pathspec-from-file="$pathspecs" --pathspec-file-nul --
+    fi
+    rm -rf -- "$cache"
+    # The smudge filter passes ciphertext through when no identity matches
+    # the envelope's recipients, so re-check before claiming success.
+    envelopes_among "$stale" >"$still"
+    while IFS= read -r -d '' f; do
+      opaque="$opaque ${f#"$root/"}"
+    done <"$still"
+    refreshed=$(($(tr -cd '\0' <"$stale" | wc -c) - $(tr -cd '\0' <"$still" | wc -c)))
   fi
   [ "$refreshed" -eq 0 ] || printf 'glassine: decrypted %d file(s) into the working tree\n' "$refreshed"
   [ -z "$opaque" ] || warn "still ciphertext (no identity on this host matches their recipients):$opaque"
@@ -1045,8 +1181,11 @@ CONFIG
                  matching the envelope's recipients and pins the winner here.
                  An explicit SOPS_AGE_SSH_PRIVATE_KEY_FILE wins.
 
-INTERNAL (invoked by git)
-  clean / smudge / textconv / merge
+INTERNAL (invoked by git, or by init)
+  clean / smudge / textconv / merge / refresh-envelope
+
+ENVIRONMENT
+  GLASSINE_JOBS  parallel decrypts during init's refresh (default: one per core)
 
 QUICKSTART (per repository)
   glassine init
@@ -1070,6 +1209,7 @@ main() {
   revoke) cmd_revoke "$@" ;;
   uninstall) cmd_uninstall "$@" ;;
   rotate) cmd_rotate "$@" ;;
+  refresh-envelope) cmd_refresh_envelope "$@" ;;
   check) cmd_check "$@" ;;
   status) cmd_status "$@" ;;
   version | --version | -v) printf 'glassine %s\n' "$VERSION" ;;

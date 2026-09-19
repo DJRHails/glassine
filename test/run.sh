@@ -870,13 +870,14 @@ ok 'duplicate allow --path skips rotation'
 )
 ok 'rotate before init fails with init guidance instead of a false report'
 
-# --- 42: init refreshes every stale envelope in ONE checkout, names taken literally
+# --- 42: init never refreshes per file, names taken literally --------------------
 # A per-file `git checkout -- <f>` paid a git start-up, an index write and a
 # clean-filter re-verify of every racy entry per envelope (~90 ms around an
-# ~8 ms decrypt; a 525-envelope clone spent 40 s in init). The refresh is one
-# checkout over the still-ciphertext list, each path a :(literal) pathspec so
-# brackets and spaces in filenames name exactly that file. A PATH shim counts
-# the checkouts git is asked for.
+# ~8 ms decrypt; a 525-envelope clone spent 40 s in init). The refresh now
+# decrypts in place and reconciles the index, with at most one checkout over
+# whatever it could not land, each path a :(literal) pathspec so brackets and
+# spaces in filenames name exactly that file. A PATH shim counts the checkouts
+# git is asked for.
 
 BATCH="$WORK/batchorigin"
 mkdir -p "$WORK/gitshim"
@@ -911,8 +912,8 @@ git_q clone "$BATCH" "$WORK/clone-batch"
   : >"$WORK/gitcalls"
   INIT_OUT=$(PATH="$WORK/gitshim:$PATH" as_host hosta glassine init 2>&1) ||
     fail "init aborted on an awkward filename: $INIT_OUT"
-  [ "$(grep -c '^checkout$' "$WORK/gitcalls")" = 1 ] ||
-    fail "init refreshed 3 envelopes with $(grep -c '^checkout$' "$WORK/gitcalls") checkouts, not one"
+  [ "$(grep -c '^checkout$' "$WORK/gitcalls" || true)" -le 1 ] ||
+    fail "init refreshed 3 envelopes with $(grep -c '^checkout$' "$WORK/gitcalls") checkouts, not at most one"
   grep -q 'bracket: demo-bracket' 'secrets/[x].yaml' ||
     fail 'init left the bracket-named envelope encrypted'
   grep -q 'spaced: demo-spaced' 'secrets/with space.yaml' ||
@@ -1026,5 +1027,192 @@ git_q clone "$MIXED" "$WORK/clone-mixed"
   esac
 )
 ok 'init refreshes exactly the envelopes a scanned key opens; the rest are listed'
+
+# --- 45: init decrypts in place and reconciles the index without a second decrypt
+# git runs a smudge filter once per file, serially, so the one-checkout
+# refresh still paid a sops start-up plus a bash parse per envelope (~13.5 s
+# on a 525-envelope clone). init now decrypts the staged blobs in parallel,
+# writes the plaintext over the worktree copies (mode preserved) and
+# reconciles the index through a clean that answers from init's cache: the
+# sops shim must show exactly one decrypt per envelope, the worktree must be
+# byte-identical to a reference decrypt, and the index must agree with it —
+# on the status right after init and again once the cache is gone.
+
+(
+  cd "$ORIGIN"
+  mkdir -p secrets
+  printf '#!/bin/sh\necho demo-run\n' >secrets/run.sh
+  chmod +x secrets/run.sh
+  as_host hosta git add secrets/run.sh
+  as_host hosta git commit -qm 'executable secret'
+)
+git_q clone "$ORIGIN" "$WORK/clone-inplace"
+(
+  cd "$WORK/clone-inplace"
+  git config user.name test && git config user.email test@example.invalid
+  ENVELOPES=$(git ls-files -z secrets | xargs -0 grep -lF 'ENC[AES256_GCM' -- | wc -l | tr -d ' ')
+  [ "$ENVELOPES" -ge 2 ] || fail "clone-inplace landed only $ENVELOPES envelope(s)"
+  : >"$WORK/sopscalls"
+  INIT_OUT=$(PATH="$WORK/sopsshim:$PATH" as_host hosta glassine init 2>&1) ||
+    fail "in-place init failed: $INIT_OUT"
+  case "$INIT_OUT" in
+  *"decrypted $ENVELOPES file(s)"*) : ;;
+  *) fail "init miscounted the in-place refresh: $INIT_OUT" ;;
+  esac
+  [ "$(grep -c '^decrypt ' "$WORK/sopscalls")" = "$ENVELOPES" ] ||
+    fail "in-place init ran $(grep -c '^decrypt ' "$WORK/sopscalls") decrypts for $ENVELOPES envelopes (the reconcile paid sops)"
+  [ -z "$(as_host hosta git status --porcelain)" ] ||
+    fail "in-place refresh left the index disagreeing with the worktree: $(as_host hosta git status --porcelain)"
+  while IFS= read -r -d '' f; do
+    git cat-file blob ":$f" >"$WORK/ref.env"
+    grep -q 'ENC\[AES256_GCM' "$WORK/ref.env" || continue
+    as_host hosta sops decrypt --filename-override "$f" "$WORK/ref.env" >"$WORK/ref.plain" 2>/dev/null ||
+      fail "reference decrypt failed for $f"
+    cmp -s "$WORK/ref.plain" "$f" || fail "in-place plaintext differs from the reference decrypt: $f"
+  done < <(git ls-files -z secrets)
+  [ -x secrets/run.sh ] || fail 'in-place refresh dropped the executable bit'
+  [ -z "$(find secrets -name '.glassine-refresh.*')" ] || fail 'in-place refresh left a temp file behind'
+  # A file written in the same second as the index is "racily clean" and git
+  # re-verifies it by content once (the checkout refresh landed in the same
+  # second too); what must hold is that it still reads clean, cache gone.
+  [ -z "$(as_host hosta git status --porcelain)" ] ||
+    fail 'a later git status read the refreshed files as modified'
+)
+ok 'init decrypts in place with one sops call per envelope; index and mode agree, now and later'
+
+# --- 46: a reconcile cache miss runs the ordinary clean -------------------------------
+# The reconcile's clean proves a hit from bytes: the plaintext git hands it
+# must equal the plaintext the worker decrypted. A glassine shim corrupts each
+# worker's cached plaintext at the seam between the decrypt and the
+# reconcile, so every lookup misses — and the miss must fall through to
+# today's clean on the same input (a second sops decrypt per file, the staged
+# envelope memoised), leaving the index clean and the plaintext untouched.
+
+mkdir -p "$WORK/glassineshim"
+REAL_GLASSINE=$(command -v glassine)
+cat >"$WORK/glassineshim/glassine" <<EOF
+#!/usr/bin/env bash
+"$REAL_GLASSINE" "\$@"
+rc=\$?
+if [ "\$1" = refresh-envelope ] && [ -f "\$3/\${4#"\$2/"}/plain" ]; then
+  printf 'stale plaintext' >"\$3/\${4#"\$2/"}/plain"
+fi
+exit \$rc
+EOF
+chmod +x "$WORK/glassineshim/glassine"
+git_q clone "$ORIGIN" "$WORK/clone-miss"
+(
+  cd "$WORK/clone-miss"
+  git config user.name test && git config user.email test@example.invalid
+  ENVELOPES=$(git ls-files -z secrets | xargs -0 grep -lF 'ENC[AES256_GCM' -- | wc -l | tr -d ' ')
+  : >"$WORK/sopscalls"
+  INIT_OUT=$(PATH="$WORK/glassineshim:$WORK/sopsshim:$PATH" as_host hosta glassine init 2>&1) ||
+    fail "init failed when every cache lookup missed: $INIT_OUT"
+  [ "$(grep -c '^decrypt ' "$WORK/sopscalls")" = "$((ENVELOPES * 2))" ] ||
+    fail "misses ran $(grep -c '^decrypt ' "$WORK/sopscalls") decrypts for $ENVELOPES envelopes, not one worker plus one clean each"
+  ! grep -q '^encrypt ' "$WORK/sopscalls" ||
+    fail 'a cache miss minted a fresh envelope instead of memoising the staged one'
+  grep -q 'ghp_demo123' secrets/creds.yaml || fail 'the miss path lost the plaintext'
+  [ -z "$(as_host hosta git status --porcelain)" ] ||
+    fail "the miss path left the index disagreeing: $(as_host hosta git status --porcelain)"
+)
+ok 'a reconcile cache miss falls back to the ordinary clean and still reconciles'
+
+# --- 47: a corrupted cache envelope never reaches the index or a commit ----------------
+# The other half of an entry: the shim scribbles the worker's copy of the
+# staged envelope while its plaintext still matches. The reconcile hands the
+# garbage to git, which refuses it — a refresh only ever records stat for
+# content hashing to what is already staged — so the staged blob, the next
+# status (through the repository's own clean) and a commit all carry the true
+# envelope, and the worktree keeps its plaintext.
+
+cat >"$WORK/glassineshim/glassine" <<EOF
+#!/usr/bin/env bash
+"$REAL_GLASSINE" "\$@"
+rc=\$?
+if [ "\$1" = refresh-envelope ] && [ -f "\$3/\${4#"\$2/"}/envelope" ]; then
+  printf 'mac: ENC[AES256_GCM,data:garbage]\n' >"\$3/\${4#"\$2/"}/envelope"
+fi
+exit \$rc
+EOF
+git_q clone "$ORIGIN" "$WORK/clone-corrupt"
+(
+  cd "$WORK/clone-corrupt"
+  git config user.name test && git config user.email test@example.invalid
+  BLOB_BEFORE=$(git rev-parse :secrets/creds.yaml)
+  INIT_OUT=$(PATH="$WORK/glassineshim:$PATH" as_host hosta glassine init 2>&1) ||
+    fail "init failed on a corrupted cache envelope: $INIT_OUT"
+  grep -q 'ghp_demo123' secrets/creds.yaml || fail 'the corrupted entry cost the plaintext'
+  [ "$(git rev-parse :secrets/creds.yaml)" = "$BLOB_BEFORE" ] ||
+    fail 'the corrupted cache envelope reached the index'
+  [ -z "$(as_host hosta git status --porcelain)" ] ||
+    fail "the corrupted entry left the index disagreeing: $(as_host hosta git status --porcelain)"
+  echo 'note: touched' >secrets/touched.yaml
+  as_host hosta git add secrets/touched.yaml
+  as_host hosta git commit -qm 'commit after a corrupted reconcile entry'
+  [ "$(git rev-parse HEAD:secrets/creds.yaml)" = "$BLOB_BEFORE" ] ||
+    fail 'the commit after a corrupted cache entry carries a different envelope'
+  ! git cat-file blob HEAD:secrets/creds.yaml | grep -q 'data:garbage' ||
+    fail 'the corrupted cache envelope was committed'
+)
+ok 'a corrupted cache envelope never reaches the index or a commit; plaintext survives'
+
+# --- 48: an envelope no worker lands takes the delete-and-checkout route ----------
+# refresh-envelope leaves no marker when it cannot install a file (no staged
+# blob, a worktree envelope that differs from the index, a failed write); init
+# must then hand every such file to the ONE literal-pathspec checkout the
+# refresh used to be. The shim turns every worker into a silent no-op, so the
+# whole stale list has to travel that route: exactly one checkout, plaintext
+# landed, index agreeing.
+
+cat >"$WORK/glassineshim/glassine" <<EOF
+#!/usr/bin/env bash
+[ "\$1" != refresh-envelope ] || exit 0
+exec "$REAL_GLASSINE" "\$@"
+EOF
+git_q clone "$ORIGIN" "$WORK/clone-fallback"
+(
+  cd "$WORK/clone-fallback"
+  git config user.name test && git config user.email test@example.invalid
+  ENVELOPES=$(git ls-files -z secrets | xargs -0 grep -lF 'ENC[AES256_GCM' -- | wc -l | tr -d ' ')
+  : >"$WORK/gitcalls"
+  INIT_OUT=$(PATH="$WORK/glassineshim:$WORK/gitshim:$PATH" as_host hosta glassine init 2>&1) ||
+    fail "init failed when no worker landed its envelope: $INIT_OUT"
+  [ "$(grep -c '^checkout$' "$WORK/gitcalls" || true)" = 1 ] ||
+    fail "the fallback ran $(grep -c '^checkout$' "$WORK/gitcalls" || true) checkouts for $ENVELOPES envelopes, not one"
+  case "$INIT_OUT" in
+  *"decrypted $ENVELOPES file(s)"*) : ;;
+  *) fail "init miscounted the fallback refresh: $INIT_OUT" ;;
+  esac
+  grep -q 'ghp_demo123' secrets/creds.yaml || fail 'the fallback checkout did not land the plaintext'
+  [ -z "$(as_host hosta git status --porcelain)" ] ||
+    fail "the fallback left the index disagreeing: $(as_host hosta git status --porcelain)"
+)
+ok 'an envelope no worker lands is refreshed by the one fallback checkout'
+
+# --- 49: init mid-merge — an unrelated conflict must not abort the reconcile -----
+# `update-index --refresh` errors out on an index holding unmerged entries
+# unless told --unmerged; -q does not cover it. A clone with a conflict in a
+# file glassine does not manage still has to decrypt its stale envelopes, and
+# leave the conflict exactly where it was.
+
+git_q clone "$ORIGIN" "$WORK/clone-conflict"
+(
+  cd "$WORK/clone-conflict"
+  git config user.name test && git config user.email test@example.invalid
+  MAIN=$(git rev-parse --abbrev-ref HEAD)
+  echo 'a' >notes.txt && git add notes.txt && git_q commit -m 'notes a'
+  git_q checkout -b side && echo 'b' >notes.txt && git_q commit -am 'notes b'
+  git_q checkout "$MAIN" && echo 'c' >notes.txt && git_q commit -am 'notes c'
+  git_q merge side || true
+  [ -n "$(git ls-files -u -- notes.txt)" ] || fail 'fixture did not leave notes.txt conflicted'
+  INIT_OUT=$(as_host hosta glassine init 2>&1) ||
+    fail "init aborted on an unrelated merge conflict: $INIT_OUT"
+  grep -q 'ghp_demo123' secrets/creds.yaml || fail 'init mid-merge left the secret encrypted'
+  [ -z "$(as_host hosta git status --porcelain -- secrets)" ] ||
+    fail "init mid-merge left secrets disagreeing with the index: $(as_host hosta git status --porcelain -- secrets)"
+  [ -n "$(git ls-files -u -- notes.txt)" ] || fail 'init resolved a conflict it does not own'
+)
+ok 'init decrypts around an unrelated merge conflict instead of aborting'
 
 printf '\nall %d tests passed\n' "$PASS"
