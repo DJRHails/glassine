@@ -351,9 +351,12 @@ regular_paths() {
 # a bash read loop over every tracked path cost ~1 s per call on a 16k-file
 # repo, the pathspec ~10 ms. Explicit pathspecs keep the check-attr pass, so
 # any pathspec magic the caller passes means exactly what git says it means.
+# GIT_LITERAL_PATHSPECS (exported to hooks by `git --literal-pathspecs`, e.g.
+# magit) would disable the attr magic and list nothing, so check would pass
+# plaintext; it is turned off for this one call.
 managed_files() { # [pathspec...]
   if [ $# -eq 0 ]; then
-    git ls-files -sz -- ':(attr:filter=glassine)' | regular_paths
+    GIT_LITERAL_PATHSPECS=0 git ls-files -sz -- ':(attr:filter=glassine)' | regular_paths
     return
   fi
   git ls-files -sz -- "$@" |

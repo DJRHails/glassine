@@ -1239,6 +1239,8 @@ ok 'init decrypts around an unrelated merge conflict instead of aborting'
   listed() { g3 glassine status | sed -E 's/^[^ ]+ +//'; }
   [ "$(listed)" = "$(expected)" ] || fail "root listing disagrees with check-attr: $(listed)"
   [ "$(listed | grep -c .)" -eq 3 ] || fail "expected s.yaml, deep/x, deep/er/sp ace.env: $(listed)"
+  [ "$(GIT_LITERAL_PATHSPECS=1 listed)" = "$(expected)" ] ||
+    fail 'listing went empty under GIT_LITERAL_PATHSPECS (magit commits export it to hooks)'
   (cd secrets/deep && [ "$(listed)" = "$(expected)" ]) ||
     fail 'subdirectory listing disagrees with check-attr'
   printf '.gitattributes -filter -diff -merge\n' >secrets/deep/.gitattributes
