@@ -1215,4 +1215,37 @@ git_q clone "$ORIGIN" "$WORK/clone-conflict"
 )
 ok 'init decrypts around an unrelated merge conflict instead of aborting'
 
+# --- 50: the managed listing is git's attribute answer, from any directory -------
+# The unrestricted listing asks git for `:(attr:filter=glassine)` instead of
+# judging every tracked path in bash. It must still agree with check-attr on
+# nested .gitattributes, spaced names, symlinks, a subdirectory cwd and an
+# unstaged .gitattributes edit.
+
+(
+  cd "$(mk_managed attrlist)"
+  mkdir -p secrets/deep/er
+  printf '.gitattributes -filter -diff -merge\nplain.txt -filter -diff -merge\n' \
+    >secrets/deep/.gitattributes
+  echo 'k: v' >secrets/deep/x && echo 'K=v' >'secrets/deep/er/sp ace.env'
+  echo 'k: v' >secrets/deep/plain.txt
+  ln -s x secrets/deep/link
+  g3 git add . && g3 git commit -qm nested
+  expected() {
+    git ls-files -z | git check-attr --stdin -z filter | tr '\0' '\n' | paste - - - |
+      awk -F'\t' '$3 == "glassine" { print $1 }' | while IFS= read -r p; do
+      [ -L "$p" ] || printf '%s\n' "$p"
+    done
+  }
+  listed() { g3 glassine status | sed -E 's/^[^ ]+ +//'; }
+  [ "$(listed)" = "$(expected)" ] || fail "root listing disagrees with check-attr: $(listed)"
+  [ "$(listed | grep -c .)" -eq 3 ] || fail "expected s.yaml, deep/x, deep/er/sp ace.env: $(listed)"
+  [ "$(GIT_LITERAL_PATHSPECS=1 listed)" = "$(expected)" ] ||
+    fail 'listing went empty under GIT_LITERAL_PATHSPECS (magit commits export it to hooks)'
+  (cd secrets/deep && [ "$(listed)" = "$(expected)" ]) ||
+    fail 'subdirectory listing disagrees with check-attr'
+  printf '.gitattributes -filter -diff -merge\n' >secrets/deep/.gitattributes
+  listed | grep -qx 'secrets/deep/plain.txt' || fail 'listing ignored an unstaged .gitattributes edit'
+)
+ok 'the managed listing matches check-attr across nesting, subdirs and unstaged attributes'
+
 printf '\nall %d tests passed\n' "$PASS"
