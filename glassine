@@ -806,6 +806,9 @@ cmd_protect() { # <glob>...
 # skipping it is what the checkout would have produced. Anything else (no
 # staged blob, a worktree envelope that differs from the index, a failed
 # write) leaves no marker and init hands the file to the checkout unchanged.
+# Under GLASSINE_REFRESH_CACHE_ONLY (init has perl, see write_refresh_filter)
+# the worktree is left alone: the entry gains a `decrypted` marker once the
+# plaintext is complete, and init's checkout installs it.
 # Never fails: a fault here is a fallback, not an abort.
 cmd_refresh_envelope() { # <root> <cache> <file>
   local root=$1 cache=$2 file=$3 path=${3#"$1/"}
@@ -818,6 +821,10 @@ cmd_refresh_envelope() { # <root> <cache> <file>
   if ! is_envelope "$entry/envelope" || ! decrypt_to "$entry/envelope" "$entry/plain" "$path"; then
     rm -f -- "$entry/plain"
     cmp -s "$entry/envelope" "$file" 2>/dev/null && : >"$entry/unopenable"
+    return 0
+  fi
+  if [ -n "${GLASSINE_REFRESH_CACHE_ONLY:-}" ]; then
+    : >"$entry/decrypted"
     return 0
   fi
   tmp=$(mktemp "${file%/*}/.glassine-refresh.XXXXXX") || return 0
@@ -855,6 +862,103 @@ if cmp -s "$entry/incoming" "$entry/plain"; then
   exec cat -- "$entry/envelope"
 fi
 exec glassine clean "$p" <"$entry/incoming"
+EOF
+}
+
+# init's fast path when perl is on PATH: the workers only decrypt into the
+# cache, and ONE checkout over the deleted worktree copies installs every
+# plaintext through this long-running filter (`filter.<driver>.process`,
+# gitattributes(5) "Long Running Filter Process"), wired with `-c` for that
+# one git call. git starts it once and speaks pkt-lines to it, so a file
+# costs a pipe round trip instead of a process — and git writes each file and
+# records its stat itself, so there is no index reconcile at all (the ~2.5 s
+# serial clean pass of write_refresh_clean on a 525-envelope clone). A
+# process filter replaces clean and smudge both for that call, so it answers
+# both. Hits are proven from bytes, never the path: a smudge serves the
+# worker's plaintext only when the blob git hands over IS the envelope that
+# worker decrypted, a clean (git re-verifying a racy entry) serves the staged
+# envelope only when the incoming plaintext IS the worker's plaintext. Every
+# miss runs the ordinary `glassine smudge` / `glassine clean` on the same
+# bytes, staged through a file beside the cache.
+write_refresh_filter() { # <file>
+  cat >"$1" <<'EOF'
+# glassine init's checkout filter (see write_refresh_filter).
+use strict;
+use warnings;
+binmode STDIN;
+binmode STDOUT;
+$| = 1;
+my $cache = $ENV{GLASSINE_REFRESH_CACHE};
+my $incoming = "$cache.incoming";
+my %proof = (smudge => ['envelope', 'plain'], clean => ['plain', 'envelope']);
+sub pkt {
+  my $n = read(STDIN, my $len, 4);
+  defined $n or die "glassine filter: read: $!\n";
+  return undef if $n == 0;
+  die "glassine filter: short pkt-line header\n" if $n != 4;
+  return '' if $len eq '0000';
+  $n = read(STDIN, my $data, hex($len) - 4);
+  die "glassine filter: short pkt-line\n" if !defined $n || $n != hex($len) - 4;
+  return $data;
+}
+sub put { print sprintf('%04x', length($_[0]) + 4), $_[0] }
+sub more { my $l = pkt(); defined $l or die "glassine filter: git hung up mid-message\n"; $l }
+sub list { my @l; while ((my $l = more()) ne '') { push @l, $l } @l }
+sub slurp {
+  open(my $fh, '<', $_[0]) or return undef;
+  binmode $fh;
+  local $/;
+  my $s = <$fh>;
+  return defined $s ? $s : '';
+}
+sub ordinary {
+  my ($command, $path, $in) = @_;
+  open(my $t, '>', $incoming) or die "glassine filter: $incoming: $!\n";
+  binmode $t;
+  print $t $in;
+  close $t or die "glassine filter: $incoming: $!\n";
+  my $pid = open(my $out, '-|');
+  defined $pid or die "glassine filter: fork: $!\n";
+  if (!$pid) {
+    open(STDIN, '<', $incoming) or die "glassine filter: $incoming: $!\n";
+    exec('glassine', $command, $path) or die "glassine filter: exec glassine: $!\n";
+  }
+  binmode $out;
+  local $/;
+  my $s = <$out>;
+  return (close($out), defined $s ? $s : '');
+}
+(pkt() // '') eq "git-filter-client\n" or die "glassine filter: not a git filter client\n";
+grep { $_ eq "version=2\n" } list() or die "glassine filter: git speaks no version 2\n";
+put("git-filter-server\n");
+put("version=2\n");
+print '0000';
+my %offered = map { $_ => 1 } list();
+for ("capability=clean\n", "capability=smudge\n") { put($_) if $offered{$_} }
+print '0000';
+while (defined(my $first = pkt())) {
+  my %req;
+  for ($first, list()) { $req{$1} = $2 if /^([^=]*)=(.*)\n\z/s }
+  my $in = '';
+  while ((my $d = more()) ne '') { $in .= $d }
+  my ($command, $path) = ($req{command} // '', $req{pathname} // '');
+  my ($entry, $p) = ("$cache/$path", $proof{$command});
+  my ($ok, $out) = (0, undef);
+  if ($p) {
+    my $known = -f "$entry/decrypted" ? slurp("$entry/$p->[0]") : undef;
+    ($ok, $out) = (1, slurp("$entry/$p->[1]")) if defined $known && $known eq $in;
+    ($ok, $out) = ordinary($command, $path, $in) if !defined $out;
+  }
+  if (!$ok || !defined $out) {
+    put("status=error\n");
+    print '0000';
+    next;
+  }
+  put("status=success\n");
+  print '0000';
+  for (my $o = 0; $o < length $out; $o += 65516) { put(substr($out, $o, 65516)) }
+  print '0000', '0000';
+}
 EOF
 }
 
@@ -947,8 +1051,15 @@ cmd_init() {
   # sops call. The cache lives in GLASSINE_TMPDIR and dies with init. Any
   # envelope a worker could not land takes the delete-and-checkout route
   # exactly as before.
+  #
+  # With perl on PATH even that reconcile (~2.5 s of a ~4.4 s isogram init:
+  # one sh per file, serially) is skipped: the workers only decrypt into the
+  # cache, every openable envelope takes the delete-and-checkout route, and
+  # the one checkout installs the plaintexts through write_refresh_filter's
+  # long-running filter, so git writes the files and their stat itself. A
+  # checkout that fails under the filter is re-run without it.
   ensure_tmpdir
-  local f refreshed=0 opaque='' entry
+  local f refreshed=0 opaque='' entry filter=''
   local stale="$GLASSINE_TMPDIR/stale" pathspecs="$GLASSINE_TMPDIR/stale_pathspecs"
   local envelopes="$GLASSINE_TMPDIR/stale_envelopes" unopenable="$GLASSINE_TMPDIR/stale_unopenable"
   local cache="$GLASSINE_TMPDIR/refresh" fallback="$GLASSINE_TMPDIR/stale_fallback"
@@ -966,7 +1077,12 @@ cmd_init() {
   done <"$unopenable"
   if [ -s "$stale" ]; then
     mkdir -p -- "$cache"
-    xargs -0 -n 1 -P "$(refresh_jobs)" glassine refresh-envelope "$root" "$cache" <"$stale" || true
+    if command -v perl >/dev/null 2>&1; then
+      filter="$GLASSINE_TMPDIR/refresh_filter.pl"
+      write_refresh_filter "$filter"
+    fi
+    GLASSINE_REFRESH_CACHE_ONLY=${filter:+1} xargs -0 -n 1 -P "$(refresh_jobs)" \
+      glassine refresh-envelope "$root" "$cache" <"$stale" || true
     : >"$pathspecs"
     : >"$fallback"
     : >"$rewritten"
@@ -996,7 +1112,17 @@ cmd_init() {
       GLASSINE_REFRESH_CACHE=$cache GLASSINE_REFRESH_CLEAN=$helper git -C "$root" \
         -c 'filter.glassine.clean=p=%f; . "$GLASSINE_REFRESH_CLEAN"' update-index -q --unmerged --refresh
     fi
-    if [ -s "$fallback" ]; then
+    if [ -s "$fallback" ] && [ -n "$filter" ]; then
+      xargs -0 rm -f -- <"$fallback"
+      # The value is deliberately literal — the sh git spawns expands it.
+      # shellcheck disable=SC2016
+      GLASSINE_REFRESH_CACHE=$cache GLASSINE_REFRESH_FILTER=$filter git -C "$root" \
+        -c 'filter.glassine.process=exec perl "$GLASSINE_REFRESH_FILTER"' \
+        checkout --pathspec-from-file="$pathspecs" --pathspec-file-nul -- || {
+        warn 'the checkout filter failed — re-checking out through the ordinary smudge'
+        git -C "$root" checkout --pathspec-from-file="$pathspecs" --pathspec-file-nul --
+      }
+    elif [ -s "$fallback" ]; then
       xargs -0 rm -f -- <"$fallback"
       git checkout --pathspec-from-file="$pathspecs" --pathspec-file-nul --
     fi

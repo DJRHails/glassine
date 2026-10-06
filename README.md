@@ -30,7 +30,8 @@ curl -fsSL https://raw.githubusercontent.com/DJRHails/glassine/main/glassine \
 ```
 
 Requires `git` ≥ 2.25 and [`sops`](https://github.com/getsops/sops) ≥ 3.10
-(`brew install sops`).
+(`brew install sops`). `perl`, where present, speeds up `glassine init` on a
+fresh clone; without it init behaves the same, only slower.
 
 ## Quickstart
 

@@ -877,14 +877,18 @@ ok 'rotate before init fails with init guidance instead of a false report'
 # decrypts in place and reconciles the index, with at most one checkout over
 # whatever it could not land, each path a :(literal) pathspec so brackets and
 # spaces in filenames name exactly that file. A PATH shim counts the checkouts
-# git is asked for.
+# git is asked for (the subcommand past any -C/-c options).
 
 BATCH="$WORK/batchorigin"
 mkdir -p "$WORK/gitshim"
 REAL_GIT=$(command -v git)
 cat >"$WORK/gitshim/git" <<EOF
 #!/usr/bin/env bash
-printf '%s\n' "\$1" >>"$WORK/gitcalls"
+sub() {
+  while [ "\${1:-}" = -C ] || [ "\${1:-}" = -c ]; do shift 2; done
+  printf '%s\n' "\${1:-}"
+}
+sub "\$@" >>"$WORK/gitcalls"
 exec "$REAL_GIT" "\$@"
 EOF
 chmod +x "$WORK/gitshim/git"
@@ -1087,6 +1091,27 @@ ok 'init decrypts in place with one sops call per envelope; index and mode agree
 # reconcile, so every lookup misses — and the miss must fall through to
 # today's clean on the same input (a second sops decrypt per file, the staged
 # envelope memoised), leaving the index clean and the plaintext untouched.
+# The reconcile only runs without perl (with it, init's checkout filter
+# installs the plaintext and test 52 covers its misses), so this runs on a
+# PATH holding every command but perl.
+
+# A PATH directory linking every command on this PATH except perl.
+noperl_path() {
+  local dir="$WORK/noperl" d f
+  local -a dirs
+  if [ ! -d "$dir" ]; then
+    mkdir -p "$dir"
+    IFS=: read -ra dirs <<<"$PATH"
+    for d in "${dirs[@]}"; do
+      for f in "$d"/*; do
+        if [ "${f##*/}" != perl ] && [ -x "$f" ] && [ ! -e "$dir/${f##*/}" ]; then
+          ln -s "$f" "$dir/${f##*/}"
+        fi
+      done
+    done
+  fi
+  printf '%s' "$dir"
+}
 
 mkdir -p "$WORK/glassineshim"
 REAL_GLASSINE=$(command -v glassine)
@@ -1106,7 +1131,7 @@ git_q clone "$ORIGIN" "$WORK/clone-miss"
   git config user.name test && git config user.email test@example.invalid
   ENVELOPES=$(git ls-files -z secrets | xargs -0 grep -lF 'ENC[AES256_GCM' -- | wc -l | tr -d ' ')
   : >"$WORK/sopscalls"
-  INIT_OUT=$(PATH="$WORK/glassineshim:$WORK/sopsshim:$PATH" as_host hosta glassine init 2>&1) ||
+  INIT_OUT=$(PATH="$WORK/glassineshim:$WORK/sopsshim:$(noperl_path)" as_host hosta glassine init 2>&1) ||
     fail "init failed when every cache lookup missed: $INIT_OUT"
   [ "$(grep -c '^decrypt ' "$WORK/sopscalls")" = "$((ENVELOPES * 2))" ] ||
     fail "misses ran $(grep -c '^decrypt ' "$WORK/sopscalls") decrypts for $ENVELOPES envelopes, not one worker plus one clean each"
@@ -1247,5 +1272,77 @@ ok 'init decrypts around an unrelated merge conflict instead of aborting'
   listed | grep -qx 'secrets/deep/plain.txt' || fail 'listing ignored an unstaged .gitattributes edit'
 )
 ok 'the managed listing matches check-attr across nesting, subdirs and unstaged attributes'
+
+# --- 51: without perl, init keeps the in-place decrypt and the index reconcile ----
+# perl is an optional fast path: on a PATH without it the workers still write
+# the plaintext in place and the index is reconciled (update-index, no
+# checkout), one sops call per envelope, worktree and index agreeing.
+
+git_q clone "$ORIGIN" "$WORK/clone-noperl"
+(
+  cd "$WORK/clone-noperl"
+  ENVELOPES=$(git ls-files -z secrets | xargs -0 grep -lF 'ENC[AES256_GCM' -- | wc -l | tr -d ' ')
+  ! PATH="$(noperl_path)" command -v perl >/dev/null || fail 'the perl-less PATH still finds perl'
+  : >"$WORK/gitcalls"
+  : >"$WORK/sopscalls"
+  INIT_OUT=$(PATH="$WORK/gitshim:$WORK/sopsshim:$(noperl_path)" as_host hosta glassine init 2>&1) ||
+    fail "init failed without perl: $INIT_OUT"
+  case "$INIT_OUT" in
+  *"decrypted $ENVELOPES file(s)"*) : ;;
+  *) fail "init without perl miscounted the refresh: $INIT_OUT" ;;
+  esac
+  grep -qx update-index "$WORK/gitcalls" || fail 'init without perl skipped the index reconcile'
+  ! grep -qx checkout "$WORK/gitcalls" || fail 'init without perl re-smudged through a checkout'
+  [ "$(grep -c '^decrypt ' "$WORK/sopscalls")" = "$ENVELOPES" ] ||
+    fail "init without perl ran $(grep -c '^decrypt ' "$WORK/sopscalls") decrypts for $ENVELOPES envelopes"
+  grep -q 'ghp_demo123' secrets/creds.yaml || fail 'init without perl left the secret encrypted'
+  [ -x secrets/run.sh ] || fail 'init without perl dropped the executable bit'
+  [ -z "$(as_host hosta git status --porcelain)" ] ||
+    fail "init without perl left the index disagreeing: $(as_host hosta git status --porcelain)"
+)
+ok 'without perl, init decrypts in place and reconciles the index as before'
+
+# --- 52: with perl, one filtered checkout installs the plaintext ---------------------
+# The checkout filter serves a worker's plaintext only when the blob git hands
+# it IS the envelope that worker decrypted. The shim scribbles every cached
+# envelope, so the filter must miss and run the ordinary smudge (a second sops
+# call) — one checkout, no reconcile, the index untouched. hostb-only.yaml is
+# opaque to hosta's key although the env identity makes it look openable: the
+# worker's decrypt fails and it stays ciphertext, byte-identical, and listed.
+
+cat >"$WORK/glassineshim/glassine" <<EOF
+#!/usr/bin/env bash
+"$REAL_GLASSINE" "\$@"
+rc=\$?
+if [ "\$1" = refresh-envelope ] && [ -f "\$3/\${4#"\$2/"}/envelope" ]; then
+  printf 'mac: ENC[AES256_GCM,data:garbage]\n' >"\$3/\${4#"\$2/"}/envelope"
+fi
+exit \$rc
+EOF
+git_q clone "$MIXED" "$WORK/clone-filter"
+(
+  cd "$WORK/clone-filter"
+  BLOB_BEFORE=$(git rev-parse :secrets/shared.yaml)
+  : >"$WORK/gitcalls"
+  : >"$WORK/sopscalls"
+  INIT_OUT=$(PATH="$WORK/glassineshim:$WORK/gitshim:$WORK/sopsshim:$PATH" as_host hosta glassine init 2>&1) ||
+    fail "init failed through the checkout filter: $INIT_OUT"
+  [ "$(grep -c '^checkout$' "$WORK/gitcalls" || true)" = 1 ] ||
+    fail "the filtered refresh ran $(grep -c '^checkout$' "$WORK/gitcalls" || true) checkouts, not one"
+  ! grep -qx update-index "$WORK/gitcalls" || fail 'the filtered refresh still reconciled the index'
+  grep -q 'shared: demo-shared' secrets/shared.yaml || fail 'the filter miss did not land the plaintext'
+  [ "$(grep -c '^decrypt .*shared\.yaml' "$WORK/sopscalls")" = 2 ] ||
+    fail "the filter miss ran $(grep -c '^decrypt .*shared\.yaml' "$WORK/sopscalls") decrypts, not the worker's plus the smudge's"
+  [ "$(git rev-parse :secrets/shared.yaml)" = "$BLOB_BEFORE" ] || fail 'the filter miss changed the index'
+  git cat-file blob :secrets/hostb-only.yaml | cmp -s - secrets/hostb-only.yaml ||
+    fail 'the filtered refresh altered the envelope its key could not open'
+  case "$INIT_OUT" in
+  *'decrypted 1 file(s)'*'still ciphertext'*': secrets/hostb-only.yaml'*) : ;;
+  *) fail "the filtered refresh misreported: $INIT_OUT" ;;
+  esac
+  [ -z "$(as_host hosta git status --porcelain)" ] ||
+    fail "the filtered refresh left the index disagreeing: $(as_host hosta git status --porcelain)"
+)
+ok 'with perl, one filtered checkout installs plaintext; a cache miss runs the ordinary smudge'
 
 printf '\nall %d tests passed\n' "$PASS"
