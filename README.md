@@ -60,9 +60,9 @@ engine — glassine itself contains **zero cryptographic decisions**.
   process per file on `git status`. [confidence: ~70% on the numbers, from
   small benches on one machine; see [Performance](#performance)]
 
-Confidence tags are an assessment of the evidence in this repo (sample sizes,
-seeds, intervals), added in a 2026-10 README audit; they are not new
-measurements.
+Confidence tags are an assessment of the evidence in this repo (the scenario
+test suite, the CI matrix, benchmark figures in commit messages), added in a
+2026-10 README audit; they are not new measurements.
 
 **Contents:** [What the design rests on](#what-the-design-rests-on) ·
 [Install](#install) · [Quickstart](#quickstart) ·
