@@ -2,6 +2,14 @@
 
 Transparent [sops](https://github.com/getsops/sops)-backed encryption for git.
 
+glassine is a single bash script (`glassine`, v0.9.0) that wires git's
+clean/smudge/diff/merge hooks to sops, so selected files are stored as sops
+envelopes in every commit while your working tree holds plaintext. It exists
+to replace transcrypt's one shared password with per-host SSH keys and real
+recipient management. **Status: active** — in day-to-day use on the author's
+own repositories, with releases through October 2026; it has had no external
+security review.
+
 Glassine is the translucent archival paper used to protect valuable documents.
 This tool keeps sops envelopes in your git history while your working tree
 holds plaintext: **opaque to the remote, transparent to anyone holding a key.**
@@ -21,6 +29,57 @@ Like [transcrypt](https://github.com/elasticdog/transcrypt), but with sops
 underneath: per-host SSH keys instead of one shared password, real recipient
 management, revocation that doesn't orphan history, and a maintained crypto
 engine — glassine itself contains **zero cryptographic decisions**.
+
+## Key takeaways
+
+- **Plaintext never gets staged by accident while the filter is configured.**
+  `init` sets `filter.glassine.required`, so a failed encrypt aborts the git
+  operation. That abort comes from git's own semantics and has no dedicated
+  test. `glassine check` catches the case where the filter isn't configured
+  (scenario 7). [confidence: ~85%; see [How it works](#how-it-works) and
+  [Verification](#verification-and-provenance)]
+- **Every command and git workflow listed here has an integration test.** That
+  covers clone, merge, rebase, stash, cherry-pick, worktrees, allow/revoke and
+  per-path grants: 52 scenarios in `test/run.sh`, run in CI on Ubuntu and
+  macOS. [confidence: ~90% that it behaves as described on those platforms;
+  untested elsewhere; see [Verification](#verification-and-provenance)]
+- **The security rests on sops and age, not on glassine.** glassine chooses
+  no ciphers and derives no keys. Its own job is the git plumbing and
+  recipient bookkeeping, and that has not been externally reviewed.
+  [confidence: ~85%; see [What the design rests on](#what-the-design-rests-on)]
+- **Revocation is forward-only.** A revoked key still reads the history it
+  could already read. Rotate the secret values after a compromise.
+  [confidence: ~95%, inherent to client-side encryption; see
+  [Sharing and revoking access](#sharing-and-revoking-access)]
+- **Main known gaps:** `git archive` on a keyed host exports plaintext,
+  symlinks are never encrypted, passphrase-protected SSH keys don't work, and
+  a merge that changes `.sops.yaml` leaves recipient drift until you run
+  `rotate`. See [Limitations](#limitations) and [Merging](#merging).
+- **Built for dotfiles-sized repos.** On the largest repo in the commit
+  history (525 envelopes), `init` takes seconds, but filters still run one
+  process per file on `git status`. [confidence: ~70% on the numbers, from
+  small benches on one machine; see [Performance](#performance)]
+
+Confidence tags are an assessment of the evidence in this repo (sample sizes,
+seeds, intervals), added in a 2026-10 README audit; they are not new
+measurements.
+
+## What the design rests on
+
+Two decisions carry the project. If either is wrong, nothing else matters:
+
+1. **Determinism by memoisation, not by cipher.** git needs `clean` to be a
+   pure function. glassine gets that by re-emitting the staged envelope when
+   it decrypts to the same plaintext, rather than by using a deterministic
+   cipher. This is what lets sops change underneath it
+   ([How it works](#how-it-works)). Integration test 2 checks it ("unchanged
+   plaintext never re-encrypts").
+2. **Delegating all cryptography to sops (age recipients from SSH keys).**
+   Confidentiality comes down to sops's AES-256-GCM envelopes and age's
+   handling of SSH keys. glassine's own risk is in plumbing: staging
+   plaintext, picking the wrong recipients, or leaking through a git path
+   that skips filters. The [Limitations](#limitations) list covers the known
+   ones.
 
 ## Install
 
@@ -171,6 +230,72 @@ Safety properties:
   filter-process protocol is the known fix if it ever matters.
 - Remote-side diffs of secrets are opaque churn (every real change mints a
   fresh data key). Local diffs are plaintext via textconv.
+- **No external security review.** The integration suite checks behaviour,
+  not adversarial robustness. There is no fuzzing and no audit of the
+  git-plumbing paths.
+- **Platforms and version floors are untested.** CI covers Ubuntu and macOS
+  with sops 3.13.1 only. Windows is not in CI. The `git` ≥ 2.25 and
+  `sops` ≥ 3.10 minimums above are stated requirements: the script does not
+  check them and CI does not run at those versions.
+
+## Verification and provenance
+
+What has been checked, and how:
+
+- **Integration suite** (`test/run.sh`, 52 numbered scenarios): each one
+  builds throwaway repos and fresh ed25519 keys in a temp dir and drives real
+  `git` + `sops`. Scenarios 21–27 replay git workflows that tend to break
+  crypt filters: stash, rebase, cherry-pick/revert, merge-induced recipient
+  drift, `git worktree add`, `git archive`, and symlinks. Scenarios 26–27 pin
+  the documented `archive` and symlink behaviour.
+- **CI** (`.github/workflows/test.yml`): runs on every push to `main` and
+  every PR, on `ubuntu-latest` and `macos-latest` with a checksum-verified
+  sops v3.13.1, plus `shellcheck -x` on Linux.
+- **This audit:** all 52 tests passed locally with git 2.43 and sops 3.13.3,
+  and `shellcheck -x glassine test/run.sh` was clean.
+- **Real use:** the commit history records `init` benchmarks on a
+  525-envelope clone of one of the author's repositories. That is the
+  evidence for use beyond the test suite. No usage statistics exist.
+
+How it was built: version 0.1.0, the plaintext merge driver and a
+20-scenario suite all landed on the first day (June 2026). Since then the
+changes have been feature additions (per-path recipients, the `~/.ssh` key
+scan), bug fixes that mostly came with a new numbered scenario, and
+performance work with a small bench in each commit message (below).
+
+### Performance
+
+<!-- data-source: commit messages for #15, #16, #17, #18, #19 -->
+
+All numbers come from commit messages. Each was measured on one machine,
+usually over about 3 repetitions (#18 states none), so read them as orders of
+magnitude:
+
+| Change | Shape | Before → after |
+|---|---|---|
+| #15 one checkout for all stale envelopes | 150 envelopes, keyed `init` | 16.0 s → 2.4 s |
+| #16 skip envelopes no local key opens | 525 unopenable envelopes | 17.1–19.1 s → 0.64–0.68 s |
+| #17 parallel in-place decrypt | 525 envelopes, keyed `init` | 18.0 / 19.4 s → 4.9–5.3 s |
+| #18 attribute pathspec for managed listing | 16k-file repo, per call | ~0.93 s → ~12 ms |
+| #19 perl long-running checkout filter | 525 envelopes | removes a step measured at ~2.5 s of a ~4.4 s `init`; no after-timing recorded |
+
+The ~100 ms-per-file filter cost behind the "~10 s per ~100 touched secrets"
+figure in [Limitations](#limitations) comes from the commit that added
+recipient-drift detection (`c0b956f`). It is an estimate, not a recorded
+bench.
+
+## Running the tests
+
+```bash
+# requires git, sops, ssh-keygen (and shellcheck for the lint step)
+env -u SOPS_AGE_SSH_PRIVATE_KEY_FILE bash test/run.sh   # prints "all 52 tests passed"
+shellcheck -x glassine test/run.sh
+```
+
+The suite isolates itself from your global git config, but not from your
+environment. If `SOPS_AGE_SSH_PRIVATE_KEY_FILE` is exported, it overrides
+`glassine.identity` (which is documented behaviour) and scenario 31 fails.
+Hence the `env -u`.
 
 ## License
 
