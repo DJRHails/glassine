@@ -64,6 +64,14 @@ Confidence tags are an assessment of the evidence in this repo (sample sizes,
 seeds, intervals), added in a 2026-10 README audit; they are not new
 measurements.
 
+**Contents:** [What the design rests on](#what-the-design-rests-on) ·
+[Install](#install) · [Quickstart](#quickstart) ·
+[Sharing and revoking access](#sharing-and-revoking-access) ·
+[Commands](#commands) · [Merging](#merging) · [How it works](#how-it-works) ·
+[Limitations](#limitations) ·
+[Verification and provenance](#verification-and-provenance) ·
+[Performance](#performance) · [Running the tests](#running-the-tests)
+
 ## What the design rests on
 
 Two decisions carry the project. If either is wrong, nothing else matters:
