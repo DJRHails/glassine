@@ -10,6 +10,15 @@ export PATH="$ROOT:$PATH"
 # Isolate from the developer's global git config (hooks, templates, signing).
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
+# Isolate from the developer's sops/age identity. Any SOPS_* variable
+# (SOPS_AGE_SSH_PRIVATE_KEY_FILE, SOPS_AGE_KEY_FILE, SOPS_AGE_RECIPIENTS, ...)
+# overrides the per-scenario keys, and XDG_CONFIG_HOME would point sops at a
+# real age keys.txt instead of the one under each scenario's HOME.
+for var in $(compgen -e); do
+  case $var in SOPS_*) unset "$var" ;; esac
+done
+unset XDG_CONFIG_HOME
+
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/glassine-test.XXXXXX")
 trap 'rm -rf -- "${WORK:?}"' EXIT
 
