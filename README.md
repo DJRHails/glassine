@@ -296,14 +296,14 @@ bench.
 
 ```bash
 # requires git, sops, ssh-keygen (and shellcheck for the lint step)
-env -u SOPS_AGE_SSH_PRIVATE_KEY_FILE bash test/run.sh   # prints "all 52 tests passed"
+bash test/run.sh   # prints "all 52 tests passed"
 shellcheck -x glassine test/run.sh
 ```
 
-The suite isolates itself from your global git config, but not from your
-environment. If `SOPS_AGE_SSH_PRIVATE_KEY_FILE` is exported, it overrides
-`glassine.identity` (which is documented behaviour) and scenario 31 fails.
-Hence the `env -u`.
+The suite isolates itself from your global git config and from your sops/age
+identity: it unsets every `SOPS_*` variable and `XDG_CONFIG_HOME` before
+running, so an exported `SOPS_AGE_SSH_PRIVATE_KEY_FILE` (or similar) cannot
+override the throwaway keys each scenario uses.
 
 ## License
 

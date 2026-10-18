@@ -45,3 +45,16 @@ jobs:
 
       - name: Integration tests
         run: bash test/run.sh
+
+      - name: Integration tests with a leaked sops/age environment
+        run: |
+          set -euo pipefail
+          leaked="$RUNNER_TEMP/leaked-xdg"
+          mkdir -p "$leaked/sops/age"
+          echo 'AGE-SECRET-KEY-1LEAKED' >"$leaked/sops/age/keys.txt"
+          SOPS_AGE_SSH_PRIVATE_KEY_FILE=/nonexistent/id_ed25519 \
+            SOPS_AGE_KEY_FILE="$leaked/sops/age/keys.txt" \
+            SOPS_AGE_KEY='AGE-SECRET-KEY-1LEAKED' \
+            SOPS_AGE_RECIPIENTS='age1leaked' \
+            XDG_CONFIG_HOME="$leaked" \
+            bash test/run.sh
